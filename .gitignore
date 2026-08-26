@@ -1,0 +1,36 @@
+# Caches built by prep.py / prep_fs.py — regenerate with `python prep.py`.
+# X.npy alone is 360 MB at 150 Hz and 1.2 GB at 500 Hz.
+cache/
+cache_*/
+SYZ/ecg_train/cache/
+SYZ/ecg_train/cache_*/
+
+# Training runs: checkpoints and probability matrices.
+runs/
+SYZ/ecg_train/runs/
+
+# Exported package (rebuild with `python export.py`).
+package/
+SYZ/ecg_train/package/
+
+# Diagnostic output (SVG strips, JSON reports).
+diag/
+SYZ/ecg_train/diag/
+
+# Loose artefacts written next to the code.
+ensemble.json
+ensemble_oof_prob.npy
+ensemble_test_prob.npy
+bench.json
+suspects.npy
+SYZ/ecg_train/ensemble.json
+SYZ/ecg_train/ensemble_*.npy
+SYZ/ecg_train/bench.json
+SYZ/ecg_train/suspects.npy
+
+# Synthetic dataset (regenerate with tools/make_synth.py).
+SYNTH/
+
+__pycache__/
+*.py[cod]
+.DS_Store

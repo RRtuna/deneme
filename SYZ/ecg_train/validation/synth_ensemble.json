@@ -1,0 +1,47 @@
+{
+  "method": "flat",
+  "members": [
+    {
+      "name": "synth_inc",
+      "path": "runs/synth_inc",
+      "oof_macro_f1": 0.9976504683537752,
+      "oof_afib_afl": 1.0,
+      "weight": 0.5
+    },
+    {
+      "name": "synth_r18",
+      "path": "runs/synth_r18",
+      "oof_macro_f1": 0.9976504683537752,
+      "oof_afib_afl": 0.9970588235294118,
+      "weight": 0.5
+    }
+  ],
+  "oof_macro_f1": 0.9976504683537752,
+  "oof_per_class": {
+    "Normal": 0.9941520467836257,
+    "AFIB": 0.9970501474926253,
+    "AFL": 0.9970501474926253,
+    "LBBB": 1.0,
+    "RBBB": 1.0
+  },
+  "oof_afib_afl": 1.0,
+  "rule_scores": {
+    "flat": 0.9976504683537752,
+    "weighted": 0.9976504683537752,
+    "stacked": 0.9964740281185008
+  },
+  "expert": null,
+  "cache": "/home/user/deneme/SYZ/ecg_train/cache_synth",
+  "n_dev": 850,
+  "n_test": 150,
+  "selected_on": "out-of-fold development set only",
+  "test_macro_f1": 0.9933314809669354,
+  "test_per_class": {
+    "Normal": 1.0,
+    "AFIB": 0.9830508474576272,
+    "AFL": 0.9836065573770492,
+    "LBBB": 1.0,
+    "RBBB": 1.0
+  },
+  "test_afib_afl": 0.9833333333333333
+}

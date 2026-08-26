@@ -1,0 +1,89 @@
+{
+  "machine": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cores_logical": 4,
+    "platform": "Linux-6.18.44-fc-v21-x86_64-with-glibc2.39",
+    "torch": "2.13.0+cu130",
+    "avx2": true,
+    "avx512f": true,
+    "avx512_bf16": false,
+    "amx_bf16": false
+  },
+  "settings": {
+    "presets": null,
+    "batch": 32,
+    "length": 1500,
+    "dev": 4250,
+    "folds": 5,
+    "epochs": 40,
+    "steps": 6,
+    "threads": 0,
+    "json": "bench.json"
+  },
+  "rows": [
+    {
+      "preset": "r18",
+      "params": 2322237,
+      "sec_per_step": 0.21003791150008055,
+      "sec_per_epoch": 22.47405653050862,
+      "hours_5fold": 1.2485586961393678,
+      "bf16_sec_per_step": null
+    },
+    {
+      "preset": "r34",
+      "params": 4326097,
+      "sec_per_step": 0.3996236589999853,
+      "sec_per_epoch": 42.75973151299843,
+      "hours_5fold": 2.3755406396110237,
+      "bf16_sec_per_step": null
+    },
+    {
+      "preset": "r18k11",
+      "params": 3545149,
+      "sec_per_step": 0.2372825174999207,
+      "sec_per_epoch": 25.389229372491513,
+      "hours_5fold": 1.4105127429161952,
+      "bf16_sec_per_step": null
+    },
+    {
+      "preset": "wide",
+      "params": 5139065,
+      "sec_per_step": 0.38601694149997456,
+      "sec_per_epoch": 41.30381274049728,
+      "hours_5fold": 2.29465626336096,
+      "bf16_sec_per_step": null
+    },
+    {
+      "preset": "w64",
+      "params": 9067189,
+      "sec_per_step": 0.5850353114999507,
+      "sec_per_epoch": 62.598778330494724,
+      "hours_5fold": 3.477709907249707,
+      "bf16_sec_per_step": null
+    },
+    {
+      "preset": "w80",
+      "params": 14106609,
+      "sec_per_step": 0.8709493680000833,
+      "sec_per_epoch": 93.19158237600891,
+      "hours_5fold": 5.177310132000495,
+      "bf16_sec_per_step": null
+    },
+    {
+      "preset": "inception",
+      "params": 999429,
+      "sec_per_step": 0.2609999410000228,
+      "sec_per_epoch": 27.926993687002437,
+      "hours_5fold": 1.5514996492779132,
+      "bf16_sec_per_step": null
+    },
+    {
+      "preset": "hybrid",
+      "params": 1250749,
+      "sec_per_step": 0.3177960205000545,
+      "sec_per_epoch": 34.00417419350583,
+      "hours_5fold": 1.8891207885281018,
+      "bf16_sec_per_step": null
+    }
+  ]
+}

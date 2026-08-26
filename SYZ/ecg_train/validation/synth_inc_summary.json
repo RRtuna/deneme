@@ -1,0 +1,83 @@
+{
+  "tag": "synth_inc",
+  "preset": "inception",
+  "cache": "cache_synth",
+  "folds": 5,
+  "epochs": 8,
+  "seed": 42,
+  "params": 999429,
+  "oof_macro_f1": 0.9976504683537752,
+  "oof_per_class": [
+    0.9941520467836257,
+    0.9970501474926253,
+    0.9970501474926253,
+    1.0,
+    1.0
+  ],
+  "oof_afib_afl": 1.0,
+  "test_macro_f1": 0.9933314809669354,
+  "test_per_class": [
+    1.0,
+    0.9830508474576272,
+    0.9836065573770492,
+    1.0,
+    1.0
+  ],
+  "test_afib_afl": 0.9833333333333333,
+  "n_dev": 850,
+  "n_test": 150,
+  "coverage": 1.0,
+  "fold_val_f1": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.9883155650319828
+  ],
+  "fold_test_f1": [
+    0.9933314809669354,
+    0.9866648143002685,
+    0.967192517101773,
+    0.9866666666666667,
+    1.0
+  ],
+  "median_best_epoch": 3,
+  "total_minutes": 4.79,
+  "args": {
+    "preset": "inception",
+    "tag": "synth_inc",
+    "cache": "cache_synth",
+    "folds": 5,
+    "only_fold": null,
+    "epochs": 8,
+    "patience": 99,
+    "batch": 32,
+    "eval_batch": 64,
+    "lr": 0.002,
+    "wd": 0.0001,
+    "dropout": 0.2,
+    "mixup": 0.3,
+    "ema": 0.999,
+    "clip": 5.0,
+    "warmup_epochs": 3,
+    "label_smoothing": 0.0,
+    "seed": 42,
+    "tta": "shift3",
+    "aug_off": "",
+    "no_features": false,
+    "exclude": "",
+    "full": false,
+    "full_epochs": 0,
+    "bf16": false,
+    "mmap": false,
+    "threads": 4,
+    "force": false
+  },
+  "classes": [
+    "Normal",
+    "AFIB",
+    "AFL",
+    "LBBB",
+    "RBBB"
+  ]
+}

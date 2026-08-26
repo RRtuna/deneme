@@ -1,0 +1,42 @@
+{
+  "oof_source": "/home/user/deneme/SYZ/ecg_train/ensemble_oof_prob.npy",
+  "n_dev": 850,
+  "n_test_excluded": 150,
+  "oof_macro_f1": 0.9976504683537752,
+  "routing_accuracy": 0.9941176470588236,
+  "within_pair_accuracy": 1.0,
+  "n_pair_records": 340,
+  "ceiling_sweep": [
+    {
+      "pair_accuracy": 0.7,
+      "macro_f1": 0.8791552535587188
+    },
+    {
+      "pair_accuracy": 0.76,
+      "macro_f1": 0.9005925897820755
+    },
+    {
+      "pair_accuracy": 0.8,
+      "macro_f1": 0.9192055922278554
+    },
+    {
+      "pair_accuracy": 0.85,
+      "macro_f1": 0.9395728240783076
+    },
+    {
+      "pair_accuracy": 0.9,
+      "macro_f1": 0.9584076296867939
+    },
+    {
+      "pair_accuracy": 0.95,
+      "macro_f1": 0.9756988350020486
+    },
+    {
+      "pair_accuracy": 1.0,
+      "macro_f1": 0.9976504683537752
+    }
+  ],
+  "threshold": 0.8,
+  "suspects": [],
+  "svg_written": []
+}
