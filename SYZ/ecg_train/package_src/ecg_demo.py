@@ -261,6 +261,94 @@ def _norm(p):
 
 
 # --------------------------------------------------------------------------
+# paket kesfi -- birden fazla surumu yan yana kosturabilmek icin
+# --------------------------------------------------------------------------
+
+def sha_file(path, n=16):
+    import hashlib
+
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()[:n]
+
+
+def describe_package(directory):
+    """Bir paket klasorunu, yuklemeden ozetle."""
+    manifest_path = os.path.join(directory, "manifest.json")
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            m = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    size = 0
+    for e in m.get("models", []):
+        p = os.path.join(directory, e["file"])
+        if os.path.exists(p):
+            size += os.path.getsize(p)
+    val = m.get("validation") or {}
+    return {
+        "dir": os.path.abspath(directory),
+        "name": os.path.basename(os.path.abspath(directory)) or directory,
+        "n_models": len(m.get("models", [])),
+        "families": sorted((m.get("member_weights") or {}).keys()),
+        "combination": m.get("combination", "flat"),
+        "precision": m.get("precision", "-"),
+        "size_mb": round(size / 1e6, 1),
+        "input_len": int(m.get("input_len", 0)),
+        "target_fs": float(m.get("target_fs", 0)),
+        "oof_macro_f1": m.get("oof_macro_f1"),
+        "test_macro_f1": val.get("test_public_macro_f1_onnx"),
+        # Her paket kendi ecg_preprocess.py'sini tasir. Iki paketin on islemesi
+        # ayni mi, bunu ancak dosyayi hash'leyerek bilebiliriz; karsilastirmada
+        # on islemeyi paylasip paylasamayacagimiza bu karar verir.
+        "preprocess_sha": sha_file(os.path.join(directory, "ecg_preprocess.py")),
+    }
+
+
+def discover_packages(hints):
+    """Verilen yollarin altinda ve yaninda manifest.json tasiyan klasorleri bul."""
+    seen, found = set(), []
+    candidates = []
+    for hint in hints:
+        if not hint:
+            continue
+        hint = os.path.abspath(hint)
+        candidates.append(hint)
+        parent = os.path.dirname(hint)
+        for base in (hint, parent, os.path.dirname(parent)):
+            if not os.path.isdir(base):
+                continue
+            try:
+                entries = sorted(os.listdir(base))
+            except OSError:
+                continue
+            for name in entries:
+                sub = os.path.join(base, name)
+                if os.path.isdir(sub):
+                    candidates.append(sub)
+                    # release/<surum>/package gibi bir seviye daha derine bak
+                    deeper = os.path.join(sub, "package")
+                    if os.path.isdir(deeper):
+                        candidates.append(deeper)
+
+    for cand in candidates:
+        key = os.path.abspath(cand)
+        if key in seen or not os.path.exists(os.path.join(key, "manifest.json")):
+            continue
+        seen.add(key)
+        info = describe_package(key)
+        if info:
+            found.append(info)
+    found.sort(key=lambda p: (-p["n_models"], p["name"]))
+    return found
+
+
+# --------------------------------------------------------------------------
 # kayit tarama
 # --------------------------------------------------------------------------
 
@@ -382,6 +470,118 @@ def macro_f1(y_true, y_pred, k):
     return float(np.mean(f1)), f1
 
 
+def run_compare(app, items, dirs, job):
+    """Ayni kayit kumesini birden fazla pakete kosturup yan yana koy.
+
+    On isleme paketler arasinda YALNIZCA ecg_preprocess.py'leri birebir ayniysa
+    (sha ve giris boyutu esitse) paylasilir. Aksi halde her grup icin ayri
+    hesaplanir -- cunku bir paketin modelini baska bir paketin on islemesiyle
+    beslemek sessizce yanlis sonuc uretir, hata vermez.
+    """
+    try:
+        with job.lock:
+            job.running, job.total, job.done = True, 0, 0
+            job.failed, job.result, job.error = 0, None, None
+            job.phase = "hazirlik"
+            job.started = time.time()
+
+        bundles = []
+        for d in dirs:
+            bundles.append((d, app.get_bundle(d)))
+
+        groups = {}
+        for d, b in bundles:
+            info = describe_package(d) or {}
+            key = (info.get("preprocess_sha", ""), b.input_len, b.target_fs)
+            groups.setdefault(key, []).append((d, b))
+
+        with job.lock:
+            job.total = len(items) * len(groups) + len(items) * len(bundles)
+
+        rows, done = [], 0
+        for _key, members in groups.items():
+            ref = members[0][1]
+            n_feat = ref.manifest.get("n_features", 37)
+            X = np.zeros((len(items), 12, ref.input_len), dtype=np.float32)
+            F = np.zeros((len(items), n_feat), dtype=np.float32)
+            ok = np.zeros(len(items), dtype=bool)
+
+            with job.lock:
+                job.phase = "on isleme"
+            t0 = time.perf_counter()
+            for i, it in enumerate(items):
+                try:
+                    sig, fs, _ = ref.wl.read_record(it["path"])
+                    x, f = ref.pre.run(sig, fs)
+                    X[i] = x
+                    if f is not None:
+                        F[i] = f[:n_feat]
+                    ok[i] = True
+                except Exception:                        # noqa: BLE001
+                    pass
+                done += 1
+                with job.lock:
+                    job.done = done
+            prep_ms = 1000 * (time.perf_counter() - t0) / max(int(ok.sum()), 1)
+            idx = np.flatnonzero(ok)
+
+            for d, b in members:
+                with job.lock:
+                    job.phase = "cikarim: %s" % os.path.basename(d)
+                t0 = time.perf_counter()
+                prob = np.zeros((len(items), len(b.classes)))
+                for s in range(0, len(idx), 32):
+                    sel = idx[s:s + 32]
+                    prob[sel] = b.predict(X[sel], F[sel])
+                    done += len(sel)
+                    with job.lock:
+                        job.done = done
+                infer_ms = 1000 * (time.perf_counter() - t0) / max(len(idx), 1)
+
+                info = describe_package(d) or {}
+                row = {"name": info.get("name", d), "dir": d,
+                       "n_models": info.get("n_models"),
+                       "size_mb": info.get("size_mb"),
+                       "prep_ms": round(prep_ms, 1),
+                       "infer_ms": round(infer_ms, 1),
+                       "total_ms": round(prep_ms + infer_ms, 1),
+                       "scored": int(ok.sum())}
+                pred = prob.argmax(1)
+                labelled = [i for i in idx if items[i]["label"] in b.classes]
+                if len(labelled) == len(idx) and len(idx):
+                    y = np.array([b.classes.index(items[i]["label"])
+                                  for i in labelled])
+                    p = pred[labelled]
+                    m, per = macro_f1(y, p, len(b.classes))
+                    row["macro_f1"] = round(m, 6)
+                    row["accuracy"] = round(float((y == p).mean()), 6)
+                    pair = np.isin(y, [1, 2]) & np.isin(p, [1, 2])
+                    if pair.any():
+                        row["afib_afl"] = round(float((y[pair] == p[pair]).mean()), 4)
+                    row["preds"] = p.tolist()
+                rows.append(row)
+
+        # Paketler ayni tahminleri mi veriyor? Bir modeli cikarmanin gercekten
+        # bir sey degistirip degistirmedigini gosteren sey budur.
+        base = rows[0].get("preds")
+        for r in rows:
+            if base is not None and r.get("preds") is not None:
+                r["diff_vs_first"] = int(sum(1 for a, b_ in zip(base, r["preds"])
+                                             if a != b_))
+            r.pop("preds", None)
+
+        with job.lock:
+            job.result = {"rows": rows, "n": len(items),
+                          "groups": len(groups),
+                          "shared_preprocess": len(groups) < len(bundles)}
+            job.running = False
+    except Exception as exc:                             # noqa: BLE001
+        with job.lock:
+            job.error = "%s: %s" % (type(exc).__name__, exc)
+            job.running = False
+            traceback.print_exc()
+
+
 def run_batch(app, items, job):
     """Kayit listesini sirayla skorla; ilerlemeyi job uzerinden bildir."""
     try:
@@ -470,13 +670,49 @@ def run_batch(app, items, job):
 # --------------------------------------------------------------------------
 
 class App:
-    def __init__(self, bundle, root):
+    MAX_LOADED = 3          # ayni anda bellekte tutulacak paket sayisi
+
+    def __init__(self, bundle, root, packages=None):
         self.bundle = bundle
+        self.active = bundle.dir
+        self.bundles = {bundle.dir: bundle}
+        self.order = [bundle.dir]
+        self.packages = packages or []
+        self.load_lock = threading.Lock()
         self.root = os.path.abspath(root) if root else None
         self.records, self.lookup = ([], {})
         if self.root and os.path.isdir(self.root):
             self.records, self.lookup = scan_records(self.root)
         self.job = BatchJob()
+        self.cmp_job = BatchJob()
+
+    def get_bundle(self, directory):
+        """Paketi (gerekirse yukleyerek) dondur; en fazla MAX_LOADED tanesi acik kalir."""
+        directory = os.path.abspath(directory)
+        with self.load_lock:
+            if directory in self.bundles:
+                self.order.remove(directory)
+                self.order.append(directory)
+                return self.bundles[directory]
+        b = Bundle(directory)                            # kilit disinda: yavas is
+        with self.load_lock:
+            self.bundles[directory] = b
+            self.order.append(directory)
+            while len(self.order) > self.MAX_LOADED:
+                drop = self.order.pop(0)
+                if drop != self.active:
+                    self.bundles.pop(drop, None)
+                else:
+                    self.order.append(drop)
+                    break
+        return b
+
+    def select(self, directory):
+        b = self.get_bundle(directory)
+        self.bundle = b
+        self.active = b.dir
+        App._cache.clear()                               # tahmin onbellegi pakete ozgu
+        return b
 
     def info(self):
         try:
@@ -511,6 +747,8 @@ class App:
             "root": self.root,
             "n_records": len(self.records),
             "offline": True,
+            "active": self.active,
+            "n_packages": len(self.packages),
         }
 
 
@@ -584,6 +822,11 @@ class Handler(BaseHTTPRequestHandler):
                     for r in self.app.records]})
             if path == "/api/batch":
                 return self._json(self.app.job.snapshot())
+            if path == "/api/packages":
+                return self._json({"packages": self.app.packages,
+                                   "active": self.app.active})
+            if path == "/api/compare":
+                return self._json(self.app.cmp_job.snapshot())
             return self._json({"error": "bulunamadi"}, 404)
         except Exception as exc:                          # noqa: BLE001
             traceback.print_exc()
@@ -612,6 +855,35 @@ class Handler(BaseHTTPRequestHandler):
                                  args=(self.app, items, self.app.job),
                                  daemon=True).start()
                 return self._json({"started": True, "total": len(items)})
+
+            if path == "/api/package/select":
+                target = str(body.get("dir") or "")
+                known = {p["dir"] for p in self.app.packages}
+                if target not in known:
+                    return self._json({"error": "bilinmeyen paket"}, 400)
+                if self.app.job.snapshot()["running"] or \
+                        self.app.cmp_job.snapshot()["running"]:
+                    return self._json({"error": "once calisan isi bekle"}, 409)
+                b = self.app.select(target)
+                return self._json({"ok": True, "active": b.dir,
+                                   "n_models": len(b.sessions)})
+
+            if path == "/api/compare/start":
+                if self.app.cmp_job.snapshot()["running"]:
+                    return self._json({"error": "zaten calisiyor"}, 409)
+                known = {p["dir"] for p in self.app.packages}
+                dirs = [d for d in (body.get("dirs") or []) if d in known]
+                if len(dirs) < 2:
+                    return self._json({"error": "en az iki paket sec"}, 400)
+                items = [r for r in self.app.records if r["label"]]
+                items = stratified_sample(items, int(body.get("limit") or 0))
+                if not items:
+                    return self._json({"error": "etiketli kayit yok"}, 400)
+                threading.Thread(target=run_compare,
+                                 args=(self.app, items, dirs, self.app.cmp_job),
+                                 daemon=True).start()
+                return self._json({"started": True, "n": len(items),
+                                   "packages": len(dirs)})
             return self._json({"error": "bulunamadi"}, 404)
         except Exception as exc:                          # noqa: BLE001
             traceback.print_exc()
@@ -766,6 +1038,19 @@ tr:last-child td{border-bottom:0}
 .prog i{display:block;height:100%;background:var(--accent);width:0;
   transition:width .25s}
 .note{color:var(--muted);font-size:12.5px;margin-top:8px}
+.pkgpick{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink2)}
+.pkgpick select{font-family:var(--mono);font-size:11.5px;padding:4px 8px;
+  border-radius:4px;border:1px solid var(--line);background:var(--panel2);
+  color:var(--ink);max-width:260px}
+.pkgpick select:focus{outline:none;border-color:var(--accent)}
+.pkgrow{display:flex;align-items:center;gap:10px;padding:8px 11px;
+  border:1px solid var(--line);border-radius:4px;margin-bottom:6px;
+  background:var(--panel);font-size:13px}
+.pkgrow input{accent-color:var(--accent);width:15px;height:15px}
+.pkgrow b{font-family:var(--mono);font-size:12.5px}
+.pkgrow .meta{color:var(--muted);font-family:var(--mono);font-size:11px;
+  margin-left:auto;text-align:right}
+.win{color:var(--accent);font-weight:650}
 .err{color:var(--afl);font-family:var(--mono);font-size:12px;margin-top:10px}
 .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line);
   border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;
@@ -782,6 +1067,10 @@ tr:last-child td{border-bottom:0}
   <span class="badge" id="b-offline">Cevrimdisi</span>
   <span class="badge grey" id="b-torch">PyTorch: -</span>
   <span class="badge grey" id="b-models">- model</span>
+  <label class="pkgpick" id="pkgwrap" hidden>
+    <span>Paket</span>
+    <select id="pkgsel"></select>
+  </label>
   <span class="spacer"></span>
   <span class="stat" id="hdr-stat"></span>
 </header>
@@ -789,6 +1078,7 @@ tr:last-child td{border-bottom:0}
 <div class="tabs">
   <button class="tab on" data-v="single">Tek Kayit</button>
   <button class="tab" data-v="batch">Toplu Skor</button>
+  <button class="tab" data-v="cmp" id="tab-cmp" hidden>Karsilastir</button>
   <button class="tab" data-v="sys">Sistem</button>
 </div>
 
@@ -830,6 +1120,22 @@ tr:last-child td{border-bottom:0}
   </div>
 </div>
 
+<div class="view" id="v-cmp">
+  <div class="pad">
+    <p class="lbl">Paketleri yan yana kostur</p>
+    <p class="note" style="margin:0 0 14px">Ayni kayit kumesi secilen her pakete
+    kosturulur. On isleme, yalnizca paketlerin <code>ecg_preprocess.py</code>
+    dosyalari birebir ayniysa paylasilir; farkliysa her paket kendi on
+    islemesiyle calisir.</p>
+    <div id="pkglist" style="margin-bottom:14px"></div>
+    <button class="primary" id="cmprun">Secilenleri Karsilastir</button>
+    <button id="cmprun200">Hizli (200 kayit)</button>
+    <div class="prog" id="cprog" hidden><i id="cprogbar"></i></div>
+    <div id="cprogtxt" class="note"></div>
+    <div id="cmpres" style="margin-top:20px"></div>
+  </div>
+</div>
+
 <div class="view" id="v-sys">
   <div class="pad">
     <p class="lbl">Sistem ve paket</p>
@@ -866,6 +1172,7 @@ async function api(url,opt){
   $('#hdr-stat').innerHTML='<b>'+esc(INFO.combination)+'</b> ensemble &middot; '+
     esc(INFO.input)+' &middot; <b>'+INFO.size_mb+'</b> MB';
   renderSys();
+  await loadPackages();
   const rr=await api('/api/records');
   RECORDS=rr.records;
   renderList();
@@ -1077,6 +1384,125 @@ function renderBatch(r){
   $('#batchres').innerHTML=h;
 }
 
+// ---------- paketler ----------
+let PKGS=[];
+async function loadPackages(){
+  const r=await api('/api/packages');
+  PKGS=r.packages||[];
+  if(PKGS.length<2) return;                 // tek paket varsa secici gereksiz
+  $('#pkgwrap').hidden=false; $('#tab-cmp').hidden=false;
+  $('#pkgsel').innerHTML=PKGS.map(p=>
+    '<option value="'+esc(p.dir)+'"'+(p.dir===r.active?' selected':'')+'>'+
+    esc(p.name)+' - '+p.n_models+' model, '+p.size_mb+' MB</option>').join('');
+  $('#pkgsel').onchange=switchPackage;
+  $('#pkglist').innerHTML=PKGS.map((p,i)=>
+    '<label class="pkgrow"><input type="checkbox" data-d="'+esc(p.dir)+'"'+
+    (i<2?' checked':'')+'><b>'+esc(p.name)+'</b>'+
+    '<span class="meta">'+p.n_models+' model &middot; '+p.size_mb+' MB &middot; '+
+    esc(p.combination)+' &middot; on isleme '+esc(p.preprocess_sha||'?')+
+    '</span></label>').join('');
+}
+
+async function switchPackage(){
+  const sel=$('#pkgsel'), dir=sel.value;
+  sel.disabled=true;
+  const prev=$('#hdr-stat').innerHTML;
+  $('#hdr-stat').innerHTML='<span class="spin"></span> paket yukleniyor...';
+  try{
+    await api('/api/package/select',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({dir})});
+    INFO=await api('/api/info');
+    $('#b-models').textContent=INFO.n_models+' model';
+    $('#hdr-stat').innerHTML='<b>'+esc(INFO.combination)+'</b> ensemble &middot; '+
+      esc(INFO.input)+' &middot; <b>'+INFO.size_mb+'</b> MB';
+    renderSys();
+    if(CUR) load(CUR.record);                // ayni kaydi yeni paketle tekrar skorla
+  }catch(e){
+    $('#hdr-stat').innerHTML=prev;
+    alert('Paket degistirilemedi: '+e.message);
+  }finally{ sel.disabled=false; }
+}
+
+// ---------- karsilastirma ----------
+let cpoll=null;
+async function startCompare(limit){
+  const dirs=[...document.querySelectorAll('#pkglist input:checked')]
+    .map(x=>x.dataset.d);
+  if(dirs.length<2){ alert('En az iki paket sec.'); return; }
+  $('#cmpres').innerHTML=''; $('#cprog').hidden=false;
+  $('#cmprun').disabled=$('#cmprun200').disabled=true;
+  try{
+    await api('/api/compare/start',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({dirs,limit:limit||0})});
+    cpoll=setInterval(ctick,500); ctick();
+  }catch(e){
+    $('#cprogtxt').innerHTML='<span class="err">'+esc(e.message)+'</span>';
+    $('#cmprun').disabled=$('#cmprun200').disabled=false;
+  }
+}
+$('#cmprun').onclick=()=>startCompare(0);
+$('#cmprun200').onclick=()=>startCompare(200);
+
+async function ctick(){
+  const s=await api('/api/compare');
+  const pct=s.total?100*s.done/s.total:0;
+  $('#cprogbar').style.width=pct.toFixed(1)+'%';
+  $('#cprogtxt').innerHTML=s.running
+    ? '<span class="spin"></span> '+esc(s.phase||'')+' &middot; '+s.elapsed+' sn'
+    : (s.error?'<span class="err">'+esc(s.error)+'</span>'
+              :'Bitti &middot; '+s.elapsed+' sn');
+  if(!s.running){
+    clearInterval(cpoll); cpoll=null;
+    $('#cmprun').disabled=$('#cmprun200').disabled=false;
+    if(s.result) renderCompare(s.result);
+  }
+}
+
+function renderCompare(r){
+  const rows=r.rows||[];
+  const best=Math.max(...rows.map(x=>x.macro_f1===undefined?-1:x.macro_f1));
+  let h='<p class="lbl">'+r.n+' kayit &middot; '+rows.length+' paket'+
+        (r.shared_preprocess
+          ? ' &middot; on isleme paylasildi (ecg_preprocess.py ayni)'
+          : ' &middot; her paket kendi on islemesiyle kostu')+'</p>';
+  h+='<div class="tw"><table><tr><th>Paket</th><th style="text-align:right">Model</th>'+
+     '<th style="text-align:right">Boyut</th><th style="text-align:right">macro-F1</th>'+
+     '<th style="text-align:right">Dogruluk</th><th style="text-align:right">AFIB/AFL</th>'+
+     '<th style="text-align:right">ms/kayit</th>'+
+     '<th style="text-align:right">Farkli tahmin</th></tr>';
+  rows.forEach((x,i)=>{
+    const win=x.macro_f1!==undefined && Math.abs(x.macro_f1-best)<1e-9;
+    h+='<tr><td>'+esc(x.name)+'</td>'+
+       '<td class="n">'+x.n_models+'</td>'+
+       '<td class="n">'+x.size_mb+' MB</td>'+
+       '<td class="n'+(win?' win':'')+'">'+
+         (x.macro_f1===undefined?'-':x.macro_f1.toFixed(4))+'</td>'+
+       '<td class="n">'+(x.accuracy===undefined?'-':x.accuracy.toFixed(4))+'</td>'+
+       '<td class="n">'+(x.afib_afl===undefined?'-':x.afib_afl.toFixed(4))+'</td>'+
+       '<td class="n">'+x.total_ms.toFixed(0)+'</td>'+
+       '<td class="n">'+(i===0?'<span style="color:var(--muted)">referans</span>'
+                              :(x.diff_vs_first===undefined?'-':x.diff_vs_first))+
+       '</td></tr>';
+  });
+  h+='</table></div>';
+
+  // Yorumu makine yapsin: skor farki ile tahmin farki ayni sey degil.
+  const a=rows[0];
+  const others=rows.slice(1).filter(x=>x.diff_vs_first!==undefined);
+  if(a && others.length){
+    const same=others.filter(x=>x.diff_vs_first===0);
+    if(same.length){
+      h+='<div class="result" style="margin-top:16px">'+
+         '<b>'+same.map(x=>esc(x.name)).join(', ')+'</b> ile <b>'+esc(a.name)+
+         '</b> '+r.n+' kaydin <b>hicbirinde</b> farkli tahmin vermedi. '+
+         'Yani aradaki model farki bu kume uzerinde tek bir karari bile '+
+         'degistirmiyor &mdash; skorun ayni cikmasi tesaduf degil.</div>';
+    }
+  }
+  $('#cmpres').innerHTML=h;
+}
+
 // ---------- sistem ----------
 function renderSys(){
   const i=INFO;
@@ -1169,8 +1595,16 @@ def main(argv=None):
                                      bundle.manifest.get("precision", "-")))
     print("on isl. : ecg_preprocess.%s()" % bundle.pre.mode)
 
+    packages = discover_packages([package, HERE, args.root or ""])
+    if len(packages) > 1:
+        print("paketler: %d bulundu (arayuzden secilebilir)" % len(packages))
+        for p in packages:
+            mark = "*" if p["dir"] == bundle.dir else " "
+            print("   %s %-34s %2d model  %6.1f MB"
+                  % (mark, p["name"][:34], p["n_models"], p["size_mb"]))
+
     root = args.root or os.path.dirname(package)
-    app = App(bundle, root)
+    app = App(bundle, root, packages)
     print("veri    : %s  (%d kayit)" % (app.root, len(app.records)))
     if not app.records:
         print("UYARI: kayit bulunamadi -- --root ile veri kokunu goster")
