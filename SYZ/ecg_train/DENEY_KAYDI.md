@@ -287,10 +287,42 @@ Harman, kalan boşluğun **%46'sını** kapatıyor. macro-F1 0.9181 → 0.9263
 Bu, sentetik kümede ölçüldü; gerçek veride geçerli olduğunu **kanıtlamaz**.
 Gerçek veride eğitimsiz doğrulama için `resid_probe.py` yazıldı (~20 sn).
 
-### Gerçek veride koşulacak (eğitim gerektirmez)
+### S4 — artığı ağa nasıl vermeli: kanal mı, özellik mi
+
+Aynı bilgi iki yoldan verilebilir. Kıyas kümesinde ikisi de koşuldu:
+
+| # | yol | girdi | AFIB/AFL | macro-F1 | p | karar |
+|---|---|---|---|---|---|---|
+| S4a | artık **kanal** olarak | 12 → 16 kanal | 0.7965 | 0.9175 | 1.0000 | **RED** |
+| S4b | artık **özellik** olarak (20 sayı) | 37 → 57 özellik | 0.8212 | 0.9276 | 0.0220 | **KABUL** |
+| S4c | + iletim oranı (25 sayı) | 37 → 62 özellik | **0.8282** | **0.9313** | **0.0036** | **KABUL** |
+
+S4a'nın sıfır çıkması (düzelen 19, bozulan 19) öğretici: ağa artık **dalgasını**
+ham olarak vermek hiçbir şey katmıyor, ama aynı artıktan **elle hesaplanmış
+sayılar** yarıyor. Ayırt edici büyüklük 10 saniyeye yayılmış global bir spektral
+özellik; 1489 kayıt ve 14 epoch ile ağ onu kendi başına öğrenmiyor. Eksik olan
+sinyal değil, tümevarım önyargısı.
+
+Bayes tavanına olan boşluk: 0.0444 → **0.0126** (%72'si kapandı).
+Ayrılmış test bölümünde (seçime hiç girmedi) 0.9147 → **0.9280**.
+
+**Teslim zinciri baştan sona doğrulandı:** `ensemble.py` → `export.py` (int8,
+kendi kendine doğrulama farkı 0.0000) → paketten ham WFDB ile çıkarım, macro-F1
+**0.9280**, eğitimle fark **0.0000**. Yani çıkarımda hesaplanan 25 sayı
+eğitimdekiyle birebir aynı. Ek maliyet **3.8 ms/kayıt**.
+
+### Gerçek veride koşulacak
 
 | # | komut | süre | ne söyler |
 |---|---|---|---|
-| P1 | `python resid_probe.py --cache cache --oof ensemble_oof_prob.npy --run runs/<ana koşu>` | ~20 sn | harman kazancı, kurtarılabilir sayısı, KARAR |
+| P1 | `python resid_probe.py --cache cache --oof ensemble_oof_prob.npy --run runs/<ana koşu>` | ~20 sn, **eğitim yok** | harman kazancı, kurtarılabilir sayısı, KARAR |
+| P2 | `python tools/make_resid_features.py --in cache --out cache_f62 --link` | ~1 dk | F.npy 37 → 62 |
+| P3 | `python train.py --cache cache_f62 --tag f62 --preset <mevcut> --folds 5 ...` | saatler | asıl kazanç |
+| P4 | `python ensemble.py --cache cache_f62 --members runs/f62 baseline/...` + `python export.py --cache cache_f62` | ~10 dk | paket |
 
-**Kapı:** macro-F1 kazancı > 0.02 → uygula; 0.008–0.02 → sınırda; < 0.008 → bırak.
+**P1 kapısı:** macro-F1 kazancı > 0.02 → uygula; 0.008–0.02 → sınırda; < 0.008 → bırak.
+
+**Dürüst uyarı:** yukarıdaki sayılar sentetik kıyas kümesinde ölçüldü. O kümede
+atriyal dalga temiz bir bant sınırlı süreç, RR aralıkları da tam katlar — yani
+ölçüm **iyimser**. Gerçek veride kazanç daha küçük olacaktır. P1 bunu 20 saniyede,
+eğitim yapmadan söyler.

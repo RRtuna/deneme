@@ -74,11 +74,46 @@ def find_fold_checkpoints(member_dir):
     return out
 
 
+def infer_shape(state_dict):
+    """Girdi genisligini AGIRLIKLARDAN oku.
+
+    Kanal ve ozellik sayisini sabit varsaymak, genisletilmis bir cache ile
+    egitilmis bir checkpoint'te `load_state_dict`'i patlatir. Checkpoint yeni
+    surumse degerleri zaten tasir; degilse ilk evrisim katmaninin ve ozellik
+    dalinin agirlik sekillerinden cikarilir.
+    """
+    in_ch, n_feat = None, None
+    for key, w in state_dict.items():
+        if in_ch is None and key.startswith("backbone.") and w.ndim == 3:
+            in_ch = int(w.shape[1])
+        if n_feat is None and key.startswith("feat_branch.") and w.ndim == 2:
+            n_feat = int(w.shape[1])
+        if in_ch is not None and n_feat is not None:
+            break
+    return in_ch, n_feat
+
+
+def feature_names_for(n_feat):
+    """Manifest'e yazilacak ozellik adlari; genisletilmisse artik adlari eklenir."""
+    names = list(ep.FEATURE_NAMES)
+    if n_feat > len(names):
+        import resid_features as rf
+        names = names + list(rf.FEATURE_NAMES)
+    if len(names) != n_feat:
+        raise SystemExit("ozellik adi sayisi (%d) model beklentisiyle (%d) "
+                         "uyusmuyor" % (len(names), n_feat))
+    return names
+
+
 def load_torch_model(ckpt_path):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = ckpt["state_dict"]
+    in_ch, n_feat = infer_shape(sd)
     model = build_model(ckpt["preset"], dropout=ckpt.get("dropout", 0.2),
-                        use_features=ckpt.get("use_features", True))
-    model.load_state_dict(ckpt["state_dict"])
+                        use_features=ckpt.get("use_features", True),
+                        in_ch=ckpt.get("in_ch") or in_ch or ep.N_LEADS,
+                        n_features=ckpt.get("n_features") or n_feat or N_FEATURES)
+    model.load_state_dict(sd)
     model.eval()
     return model, ckpt
 
@@ -93,8 +128,9 @@ def export_one(model, out_path, input_len):
     something that breaks the moment somebody copies only the ``.onnx`` files.
     We want one self-contained file per model, and we want int8 to work.
     """
-    dummy_x = torch.zeros(2, ep.N_LEADS, input_len)
-    dummy_f = torch.zeros(2, N_FEATURES)
+    in_ch, n_feat = infer_shape(model.state_dict())
+    dummy_x = torch.zeros(2, in_ch or ep.N_LEADS, input_len)
+    dummy_f = torch.zeros(2, n_feat or N_FEATURES)
     kwargs = dict(
         input_names=["signal", "features"], output_names=["logits"],
         dynamic_axes={"signal": {0: "batch"}, "features": {0: "batch"},
@@ -251,6 +287,8 @@ def main(argv=None):
                 "max_prob_diff_vs_torch": diff,
                 "int8_max_prob_diff_vs_torch": diff8,
                 "preset": ckpt["preset"],
+                "n_features": int(model.feat_mean.shape[0])
+                if getattr(model, "feat_branch", None) is not None else N_FEATURES,
             })
 
     if not exported:
@@ -317,8 +355,17 @@ def main(argv=None):
             e.pop(tmp, None)
 
     # ---- copy the runtime files ----
-    for name in ("ecg_preprocess.py", "wfdb_lite.py"):
-        shutil.copy2(os.path.join(HERE, name), os.path.join(out_dir, name))
+    # Modeller 37'den fazla ozellik bekliyorsa artik olcumlerinin kodu da
+    # pakete girmeli, yoksa cikarim eksik ozellik vektoruyle calisir.
+    n_feat_pkg = max((e.get("n_features") or N_FEATURES) for e in exported)
+    runtime = ["ecg_preprocess.py", "wfdb_lite.py"]
+    if n_feat_pkg > N_FEATURES:
+        runtime.append("resid_features.py")
+    for name in runtime:
+        src = os.path.join(HERE, name)
+        if not os.path.exists(src):
+            raise SystemExit("%s yok -- paket eksik olur" % src)
+        shutil.copy2(src, os.path.join(out_dir, name))
     predict_src = os.path.join(HERE, "package_src", "predict.py")
     if os.path.exists(predict_src):
         shutil.copy2(predict_src, os.path.join(out_dir, "predict.py"))
@@ -334,8 +381,8 @@ def main(argv=None):
         "input_len": int(input_len),
         "target_fs": ep.TARGET_FS,
         "classes": list(ep.CLASSES),
-        "n_features": N_FEATURES,
-        "feature_names": list(ep.FEATURE_NAMES),
+        "n_features": int(n_feat_pkg),
+        "feature_names": feature_names_for(n_feat_pkg),
         "combination": ens.get("method", "flat"),
         "member_weights": member_weights,
         "models": exported,

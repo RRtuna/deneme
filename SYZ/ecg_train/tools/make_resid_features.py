@@ -1,9 +1,9 @@
-"""make_resid_features -- mevcut cache'in F.npy'sine 20 bant-artik olcumu ekler.
+"""make_resid_features -- mevcut cache'in F.npy'sine 25 artik olcumu ekler.
 
-    python tools/make_resid_features.py --in cache --out cache_f57
+    python tools/make_resid_features.py --in cache --out cache_f62 --link
 
 X.npy'ye **dokunmaz** (sembolik baglanti ya da kopya), yalnizca F.npy 37'den
-57'ye genisler. `ecg_preprocess.py` degismez, on isleme davranisi ayni kalir.
+62'ye genisler. `ecg_preprocess.py` degismez, on isleme davranisi ayni kalir.
 
 Neden bu yol, artik KANALI eklemekten daha ucuz
 -----------------------------------------------
@@ -12,8 +12,8 @@ zorundadir ve ONNX girdi sekli degisir. Ozellik yolu ise yalnizca ozellik
 dalinin ilk katmanini genisletir: girdi sekli ayni kalir, cikarimda ek maliyet
 kayit basina ~4 ms'dir (mevcut 660 ms on islemenin yaninda gorunmez).
 
-Olcumler `resid_probe.py` ile bire bir aynidir; orada OOF uzerinde
-dogrulandiktan sonra buraya tasinir.
+Olcumler `resid_features.py`'den gelir -- ayni hesap `resid_probe.py`'de ve
+paketin `predict.py`'sinde de kullanilir, yani tek kaynaktir.
 """
 
 from __future__ import annotations
@@ -30,18 +30,15 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from resid_probe import (RESID_LEADS, STAT_NAMES, lead_indices,  # noqa: E402
-                         record_features, _RPEAK_MODE)
-
-NEW_NAMES = tuple("resid_%s_%s" % (lead.lower(), stat)
-                  for lead in RESID_LEADS for stat in STAT_NAMES)
+from resid_features import (FEATURE_NAMES as NEW_NAMES,  # noqa: E402
+                            lead_indices, record_features, _RPEAK_MODE)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--in", dest="src", default="cache")
-    ap.add_argument("--out", dest="dst", default="cache_f57")
+    ap.add_argument("--out", dest="dst", default="cache_f62")
     ap.add_argument("--fs", type=float, default=0.0)
     ap.add_argument("--link", action="store_true",
                     help="X.npy'yi kopyalamak yerine sembolik bagla (yer kazanir)")
@@ -105,7 +102,7 @@ def main(argv=None):
 
     print()
     print("yazildi: %s  (%.0f sn)" % (args.dst, time.time() - t0))
-    print("sonraki: python train.py --cache %s --tag f57 ..." % args.dst)
+    print("sonraki: python train.py --cache %s --tag f62 ..." % args.dst)
     return 0
 
 

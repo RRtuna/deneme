@@ -28,7 +28,18 @@ Bu betik ayni olcumleri once QRS'i cikardiktan sonra yapar:
        entropi, baskin frekans, otokorelasyon tepesi, genlik  ->  20 sayi
     4. bu 20 sayiya duz lojistik regresyon (fold-disi) takilir
 
-Sonra tek soru sorulur: bu prob, agin YANILDIGI kayitlarda dogru mu biliyor?
+Ikinci, bagimsiz olcum: **iletim orani**. AFL'de ventrikuler yanit atriyal
+dongunun tam katidir (2:1, 3:1, 4:1 blok); AFIB'de boyle bir yapi yoktur. RR
+aralikarinin ortak bir T'nin tam katlari olup olmadigi olculur:
+
+    maliyet(T) = ortalama | RR/T - yuvarla(RR/T) |
+
+Bu istatistik olcek-bagimsizdir: rastgele RR icin beklenen degeri her T'de
+0.25'tir, tam katlarda 0'a iner. Mevcut 37 ozellikteki `rr_std`, `rr_rmssd`,
+`rr_pnn50` bu tamsayi yapisini tamamen yok eder -- yalnizca "ne kadar
+duzensiz" der, "duzensizligin yapisi var mi" demez.
+
+Sonra tek soru sorulur: bu problar, agin YANILDIGI kayitlarda dogru mu biliyor?
 
 Ne basiliyor
 ------------
@@ -56,162 +67,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-try:
-    import ecg_preprocess as ep
-except Exception:                                   # pragma: no cover
-    ep = None
+from resid_features import (BAND, COND_NAMES, RESID_LEADS, STAT_NAMES,
+                            _EPS, _RPEAK_MODE, lead_indices, record_features)
 
-RESID_LEADS = ("II", "III", "aVF", "V1")
-BAND = (2.5, 12.0)          # atriyal bant: flutter 4-6 Hz, fib 6-10 Hz
-STAT_NAMES = ("conc", "ent", "dom", "ac", "rms")
 CLASSES = ("Normal", "AFIB", "AFL", "LBBB", "RBBB")
-_EPS = 1e-12
-
-
-# --------------------------------------------------------------------------
-# derivasyon indeksi ve R tepeleri -- iki API yazimini da destekle
-# --------------------------------------------------------------------------
-
-def lead_indices():
-    default = {"I": 0, "II": 1, "III": 2, "aVR": 3, "aVL": 4, "aVF": 5,
-               "V1": 6, "V2": 7, "V3": 8, "V4": 9, "V5": 10, "V6": 11}
-    for attr in ("STANDARD_LEADS", "LEADS", "LEAD_NAMES"):
-        leads = getattr(ep, attr, None) if ep else None
-        if leads and len(leads) == 12:
-            up = [str(s).upper() for s in leads]
-            try:
-                return [up.index(n.upper()) for n in RESID_LEADS]
-            except ValueError:
-                break
-    return [default[n] for n in RESID_LEADS]
-
-
-def _fallback_rpeaks(x, fs):
-    """Basit ama saglam R bulucu -- modulun API'si tutmazsa devreye girer."""
-    d = np.diff(x, prepend=x[0])
-    e = d * d
-    w = max(int(0.12 * fs), 3)
-    k = np.ones(w) / w
-    s = np.convolve(e, k, mode="same")
-    thr = 0.35 * float(np.percentile(s, 99))
-    if thr <= _EPS:
-        return np.array([], dtype=int)
-    above = s > thr
-    peaks, i, n = [], 0, s.size
-    refractory = int(0.20 * fs)
-    while i < n:
-        if above[i]:
-            j = i
-            while j < n and above[j]:
-                j += 1
-            peaks.append(i + int(np.argmax(np.abs(x[i:j]))))
-            i = j + refractory
-        else:
-            i += 1
-    return np.array(peaks, dtype=int)
-
-
-_RPEAK_MODE = [None]
-
-
-def rpeaks(sig, fs):
-    if _RPEAK_MODE[0] == "fallback":
-        return _fallback_rpeaks(sig[1], fs)
-    for fname in ("detect_rpeaks", "detect_r"):
-        fn = getattr(ep, fname, None) if ep else None
-        if fn is None:
-            continue
-        for arg in (sig, sig[1]):
-            try:
-                out = np.asarray(fn(arg, fs), dtype=int).ravel()
-            except Exception:
-                continue
-            if out.size >= 3:
-                _RPEAK_MODE[0] = fname
-                return out
-    _RPEAK_MODE[0] = "fallback"
-    return _fallback_rpeaks(sig[1], fs)
-
-
-# --------------------------------------------------------------------------
-# QRST iptali + bant sinirlama
-# --------------------------------------------------------------------------
-
-def cancel_qrst(x, peaks, fs, pre=0.25, post=0.45):
-    """Medyan sablonu vurus basina olcekleyip cikar; geriye atriyal artik kalir."""
-    x = np.asarray(x, dtype=np.float64)
-    n = x.size
-    w_pre, w_post = int(round(pre * fs)), int(round(post * fs))
-    usable = [int(p) for p in peaks if p - w_pre >= 0 and p + w_post < n]
-    if len(usable) < 3:
-        return x - x.mean()
-    segs = np.stack([x[p - w_pre:p + w_post] for p in usable])
-    template = np.median(segs, axis=0)      # medyan: tek bozuk vurus kaydirmasin
-    energy = float(template @ template)
-    if energy < _EPS:
-        return x - x.mean()
-    res = x.copy()
-    for p in usable:
-        a, b = p - w_pre, p + w_post
-        seg = x[a:b]
-        res[a:b] = seg - (float(seg @ template) / energy) * template
-    return res - res.mean()
-
-
-def bandlimit(x, fs, lo=BAND[0], hi=BAND[1], roll=0.5):
-    """FFT ile sifir-fazli bant sinirlama.
-
-    Kendi filtresini kurar: `ecg_preprocess`'in filtre API'sine bagimli degil,
-    yani o dosyanin hangi surumu olursa olsun calisir. 10 saniyelik pencerede
-    FFT maskesi IIR filtreden hem daha keskin hem de faz kaydirmasiz.
-    """
-    x = np.asarray(x, dtype=np.float64)
-    x = x - x.mean()
-    n = x.size
-    spec = np.fft.rfft(x)
-    fr = np.fft.rfftfreq(n, 1.0 / fs)
-    g = np.ones_like(fr)
-    g[fr < lo - roll] = 0.0
-    g[fr > hi + roll] = 0.0
-    lo_edge = (fr >= lo - roll) & (fr < lo)
-    hi_edge = (fr > hi) & (fr <= hi + roll)
-    g[lo_edge] = 0.5 * (1 - np.cos(np.pi * (fr[lo_edge] - (lo - roll)) / roll))
-    g[hi_edge] = 0.5 * (1 + np.cos(np.pi * (fr[hi_edge] - hi) / roll))
-    return np.fft.irfft(spec * g, n=n)
-
-
-def stats(r, fs, lo=BAND[0], hi=BAND[1]):
-    """Bir artiktan 5 olcum. Organize flutter -> yuksek conc/ac, dusuk ent."""
-    r = np.asarray(r, dtype=np.float64)
-    r = r - r.mean()
-    if r.size < 32 or not np.any(np.abs(r) > _EPS):
-        return [0.0] * 5
-    sp = np.abs(np.fft.rfft(r * np.hanning(r.size))) ** 2
-    fr = np.fft.rfftfreq(r.size, 1.0 / fs)
-    m = (fr > lo) & (fr < hi)
-    s, f = sp[m], fr[m]
-    total = float(s.sum())
-    if total <= _EPS or s.size < 4:
-        return [0.0] * 5
-    p = s / total
-    conc = float(s.max() / total)                       # tepe / toplam
-    ent = float(-(p * np.log(p + _EPS)).sum() / np.log(p.size))
-    dom = float(f[int(s.argmax())])
-    a = np.correlate(r, r, "full")[r.size - 1:]
-    a = a / (a[0] + _EPS)
-    k0, k1 = max(int(fs / hi), 1), min(int(fs / lo), a.size - 1)
-    ac = float(a[k0:k1].max()) if k1 > k0 else 0.0
-    return [conc, ent, dom, ac, float(r.std())]
-
-
-def record_features(sig, fs, lead_idx):
-    pk = rpeaks(sig, fs)
-    out = []
-    for i in lead_idx:
-        res = cancel_qrst(sig[i], pk, fs)
-        out.extend(stats(bandlimit(res, fs), fs))
-    return out
-
 
 # --------------------------------------------------------------------------
 # bagimsiz lojistik regresyon (sklearn surumune bagimli olmamak icin)
@@ -317,7 +176,8 @@ def main(argv=None):
     print()
 
     t0 = time.time()
-    F = np.zeros((len(rows), len(RESID_LEADS) * len(STAT_NAMES)))
+    n_band = len(RESID_LEADS) * len(STAT_NAMES)
+    F = np.zeros((len(rows), n_band + len(COND_NAMES)))
     for n, i in enumerate(dev):
         F[i] = record_features(np.asarray(X[i], dtype=np.float64), fs, lead_idx)
         if (n + 1) % 500 == 0 or n + 1 == len(dev):
@@ -350,44 +210,32 @@ def main(argv=None):
         print("  NOT: aginkiyle ayni degil; harman kazanci bir miktar iyimser")
         print("  olabilir. --run runs/<kosu> vererek bunu ortadan kaldir.")
 
-    q = np.zeros(len(pair))                          # fold-disi P(AFL)
-    for k in np.unique(fold):
-        tr, te = fold != k, fold == k
-        q[te] = predict_logreg(fit_logreg(Fp[tr], Lp[tr]), Fp[te])
+    def oof_probe(cols):
+        """Verilen sutunlarla fold-disi P(AFL)."""
+        out = np.zeros(len(pair))
+        sub = Fp[:, cols]
+        for k in np.unique(fold):
+            tr, te = fold != k, fold == k
+            out[te] = predict_logreg(fit_logreg(sub[tr], Lp[tr]), sub[te])
+        return out
+
+    band_cols = list(range(n_band))
+    cond_cols = list(range(n_band, F.shape[1]))
+    blocks = [("bant-artik (%d sayi)" % len(band_cols), band_cols),
+              ("iletim orani (%d sayi)" % len(cond_cols), cond_cols),
+              ("ikisi birden (%d sayi)" % F.shape[1], band_cols + cond_cols)]
 
     net_pair = prob[pair][:, [1, 2]]
     net_pair = net_pair / np.clip(net_pair.sum(1, keepdims=True), _EPS, None)
     p_net = net_pair[:, 1]                           # agin ikili-ici P(AFL)
-
     truth = Lp.astype(int)
     ok_net = (p_net > 0.5).astype(int) == truth
-    ok_prb = (q > 0.5).astype(int) == truth
 
-    print()
-    print("IKILI (AFIB vs AFL), %d kayit" % len(pair))
-    print("  ag (mevcut OOF)        : %.4f" % ok_net.mean())
-    print("  bant-artik probu       : %.4f" % ok_prb.mean())
-    print("  ayni tahmin orani      : %.4f  %s"
-          % (float(((p_net > 0.5) == (q > 0.5)).mean()),
-             "(< 0.85: farkli bakiyorlar)"))
-    print("  ikisi de yanlis        : %4d  (hicbir birlesim kurtaramaz)"
-          % int((~ok_net & ~ok_prb).sum()))
-    print("  sadece prob dogru      : %4d  <- aga eklenebilecek yeni bilgi"
-          % int((~ok_net & ok_prb).sum()))
-    print("  sadece ag dogru        : %4d" % int((ok_net & ~ok_prb).sum()))
-    print("  KURTARILABILIR         : %4d" % int((ok_net ^ ok_prb).sum()))
-
-    # --- harman: yalnizca ikili KARARI degistir, diger siniflara dokunma ---
-    yd, pd_ = y[dev], prob[dev].argmax(1)
-    base_f1, _ = macro_f1(yd, pd_)
+    yd = y[dev]
+    base_f1, _ = macro_f1(yd, prob[dev].argmax(1))
     pos = {int(g): n for n, g in enumerate(pair)}    # global -> pair sirasi
 
-    print()
-    print("%-8s %12s %12s %12s" % ("w(prob)", "ikili dog.", "macro-F1", "fark"))
-    best = (0.0, ok_net.mean(), base_f1)
-    for w in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7):
-        mixed = (1 - w) * p_net + w * q
-        acc = float(((mixed > 0.5).astype(int) == truth).mean())
+    def blended_f1(mixed):
         newp = prob[dev].copy()
         for n, g in enumerate(dev):
             j = pos.get(int(g))
@@ -396,30 +244,63 @@ def main(argv=None):
             s = newp[n, 1] + newp[n, 2]
             newp[n, 1] = s * (1 - mixed[j])
             newp[n, 2] = s * mixed[j]
-        f1, _ = macro_f1(yd, newp.argmax(1))
-        print("%-8.1f %12.4f %12.4f %+12.4f" % (w, acc, f1, f1 - base_f1))
-        if f1 > best[2]:
-            best = (w, acc, f1)
+        return macro_f1(yd, newp.argmax(1))[0]
+
+    print()
+    print("IKILI (AFIB vs AFL), %d kayit" % len(pair))
+    print("  ag (mevcut OOF) : %.4f    referans macro-F1 %.4f"
+          % (ok_net.mean(), base_f1))
+
+    best = (None, 0.0, ok_net.mean(), base_f1)
+    probes = {}
+    for name, cols in blocks:
+        q = oof_probe(cols)
+        probes[name] = q
+        ok_p = (q > 0.5).astype(int) == truth
+        agree = float(((p_net > 0.5) == (q > 0.5)).mean())
+        print()
+        print("  %s" % name)
+        print("    tek basina dogruluk : %.4f" % ok_p.mean())
+        print("    ayni tahmin orani   : %.4f  %s"
+              % (agree, "FARKLI bakiyorlar" if agree < 0.85 else "ayni seyi goruyorlar"))
+        print("    ikisi de yanlis     : %4d  (hicbir birlesim kurtaramaz)"
+              % int((~ok_net & ~ok_p).sum()))
+        print("    sadece prob dogru   : %4d  <- yeni bilgi" % int((~ok_net & ok_p).sum()))
+        print("    sadece ag dogru     : %4d" % int((ok_net & ~ok_p).sum()))
+        print("    KURTARILABILIR      : %4d" % int((ok_net ^ ok_p).sum()))
+        print("    %-8s %12s %12s %12s" % ("w", "ikili dog.", "macro-F1", "fark"))
+        for w in (0.2, 0.3, 0.4, 0.5, 0.6):
+            mixed = (1 - w) * p_net + w * q
+            acc = float(((mixed > 0.5).astype(int) == truth).mean())
+            f1 = blended_f1(mixed)
+            flag = ""
+            if f1 > best[3]:
+                best = (name, w, acc, f1)
+                flag = "  <-"
+            print("    %-8.1f %12.4f %12.4f %+12.4f%s" % (w, acc, f1, f1 - base_f1, flag))
 
     np.save(args.save, F)
-    gain = best[2] - base_f1
+    gain = best[3] - base_f1
+    best = (best[1], best[2], best[3], best[0])
     print()
-    print("en iyi w = %.1f   ikili %.4f   macro-F1 %.4f  (%+.4f)"
-          % (best[0], best[1], best[2], gain))
-    print("20 ozellik yazildi: %s" % args.save)
+    print("EN IYI: %s, w = %.1f   ikili %.4f   macro-F1 %.4f  (%+.4f)"
+          % (best[3], best[0], best[1], best[2], gain))
+    print("%d ozellik yazildi: %s" % (F.shape[1], args.save))
     print()
     print("KARAR")
     if gain > 0.02:
         print("  UYGULA. Kazanc buyuk ve kaynagi yeni bilgi (kurtarilabilir > 0).")
-        print("  Sonraki adim: bu 20 sayiyi ozellik dalina ekleyip yeniden egit")
-        print("  (37 -> 57), ya da w=%.1f harmanini ensemble.py'ye sabitle."
+        print("  Sonraki adim: bu sayilari ozellik dalina ekleyip yeniden egit")
+        print("    python tools/make_resid_features.py --in cache --out cache_f62 --link")
+        print("    python train.py --cache cache_f62 --tag f62 ...")
+        print("  Ya da egitim yapmadan w=%.1f harmanini ensemble.py'ye sabitle."
               % best[0])
     elif gain > 0.008:
         print("  SINIRDA (%+.4f). Egitim gerektirmeyen harman ucuz -- OOF'ta" % gain)
         print("  dogrulandiysa uygula, ama tek basina yarismayi cevirmez.")
     else:
-        print("  BIRAK (%+.4f). Ham sinyaldeki flutter ozellikleri bu bilgiyi" % gain)
-        print("  zaten yakalamis; QRST iptali ek bir sey getirmiyor.")
+        print("  BIRAK (%+.4f). Mevcut ozellikler bu bilgiyi zaten yakalamis;" % gain)
+        print("  QRST iptali ve iletim orani ek bir sey getirmiyor.")
         print("  DENEY_KAYDI.md'ye yaz -- bu da savunulabilir bir sonuc.")
     print()
     print("UYARI: buradaki w OOF uzerinde secildi. test_public'e yalnizca")

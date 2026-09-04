@@ -449,6 +449,7 @@ def train_one_fold(args, fold, X, Fe, y, dev_idx, fold_of, test_idx, run_dir):
             torch.save({"state_dict": eval_model.state_dict(),
                         "preset": args.preset, "dropout": args.dropout,
                         "use_features": not args.no_features,
+                        "in_ch": IN_CH, "n_features": N_FEAT,
                         "feat_mean": mean.tolist(), "feat_std": std.tolist(),
                         "epoch": epoch, "val_f1": f1},
                        os.path.join(fold_dir, "best.pt"))
@@ -742,6 +743,7 @@ def train_full(args, X, Fe, y, dev_idx, results, run_dir):
     final.load_state_dict(ema.state_dict(model))
     torch.save({"state_dict": final.state_dict(), "preset": args.preset,
                 "dropout": args.dropout, "use_features": not args.no_features,
+                "in_ch": IN_CH, "n_features": N_FEAT,
                 "epochs": epochs, "trained_on": "all dev"},
                os.path.join(full_dir, "best.pt"))
     print("  yazildi: %s/best.pt  (OOF'u YOK -- ensemble'a ek uye olarak kullan)"

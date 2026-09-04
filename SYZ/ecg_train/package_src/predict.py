@@ -31,6 +31,11 @@ sys.path.insert(0, HERE)
 import ecg_preprocess as ep       # noqa: E402
 import wfdb_lite as wl            # noqa: E402
 
+try:                              # QRST-artik olcumleri (yalnizca genisletilmis
+    import resid_features as rf   # modellerde bulunur; yoksa paket 37 ozelliklidir)
+except Exception:                 # noqa: BLE001
+    rf = None
+
 CLASSES = list(ep.CLASSES)
 
 _LABEL_ALIASES = {
@@ -87,6 +92,9 @@ class Bundle:
 
         self.member_weights = self.manifest.get("member_weights") or {}
         self.input_len = int(self.manifest.get("input_len", ep.TARGET_LEN))
+        self.n_features = int(self.manifest.get("n_features", ep.N_FEATURES))
+        # 37'den fazlaysa modeller QRST-artik olcumlerini de bekliyor demektir.
+        self.extra_features = self.n_features > len(ep.FEATURE_NAMES)
         self.classes = self.manifest.get("classes", CLASSES)
         self.stacker = self.manifest.get("stacker")
         self.stacker_order = self.manifest.get("stacker_member_order")
@@ -143,11 +151,23 @@ def _normalise(prob):
 # record loading
 # --------------------------------------------------------------------------
 
-def load_one(path, target_fs=None):
-    """Header path -> (signal_for_network, features)."""
+def load_one(path, target_fs=None, extra=False):
+    """Header path -> (signal_for_network, features).
+
+    ``extra`` acikken 25 QRST-artik olcumu de eklenir. Bunlar **on islenmis**
+    sinyalden hesaplanir (egitimde cache'in X.npy'sinden hesaplandigi gibi);
+    ham sinyalden hesaplamak farkli sayilar uretir ve skoru sessizce dusurur.
+    """
     sig, fs, _leads = wl.read_record(path)
     x = ep.preprocess_signal(sig, fs, target_fs=target_fs)
     f = ep.extract_features(sig, fs)
+    if extra:
+        if rf is None:
+            raise SystemExit("manifest 37'den fazla ozellik istiyor ama "
+                             "resid_features.py pakette yok")
+        f = np.concatenate([np.asarray(f, dtype=np.float32),
+                            rf.extract(x, target_fs or ep.TARGET_FS
+                                       ).astype(np.float32)])
     return x, f
 
 
@@ -265,7 +285,7 @@ def main(argv=None):
 
     # ---- single record ----
     if args.record:
-        x, f = load_one(args.record, target_fs)
+        x, f = load_one(args.record, target_fs, bundle.extra_features)
         prob = bundle.predict_proba(x[None, ...], f[None, ...])[0]
         order = np.argsort(-prob)
         print("\n%s" % os.path.basename(args.record))
@@ -289,13 +309,13 @@ def main(argv=None):
     print("%d kayit islenecek" % len(pairs))
 
     signals = np.zeros((len(pairs), ep.N_LEADS, bundle.input_len), dtype=np.float32)
-    features = np.zeros((len(pairs), len(ep.FEATURE_NAMES)), dtype=np.float32)
+    features = np.zeros((len(pairs), bundle.n_features), dtype=np.float32)
     failed = []
     t0 = time.time()
 
     for i, (path, _label) in enumerate(pairs):
         try:
-            x, f = load_one(path, target_fs)
+            x, f = load_one(path, target_fs, bundle.extra_features)
             signals[i], features[i] = x, f
         except Exception as exc:                # noqa: BLE001
             failed.append((path, str(exc)))
