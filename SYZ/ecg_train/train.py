@@ -40,6 +40,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ecg_preprocess as ep
 from model import N_CLASSES, N_FEATURES, PRESETS, build_model, count_parameters
 
+# Girdi genisligi cache'ten okunur: kanal sayisi (12 derivasyon + varsa
+# QRST-iptalli artik kanallari) ve ozellik sayisi (37 + varsa bant-artik
+# olcumleri). Sabit yazmak, genisletilmis bir cache'te sessizce yanlis model
+# kurar -- bu yuzden tek kaynak X.npy ile F.npy'nin kendisidir.
+IN_CH = 12
+N_FEAT = N_FEATURES
+
+
+def net(args):
+    return build_model(args.preset, dropout=args.dropout,
+                       use_features=not args.no_features,
+                       in_ch=IN_CH, n_features=N_FEAT)
+
+
 DEV_SPLITS = ("train", "validation")
 TEST_SPLIT = "test_public"
 
@@ -339,8 +353,7 @@ def train_one_fold(args, fold, X, Fe, y, dev_idx, fold_of, test_idx, run_dir):
     torch.manual_seed(args.seed + fold)
     np.random.seed(args.seed + fold)
 
-    model = build_model(args.preset, dropout=args.dropout,
-                        use_features=not args.no_features)
+    model = net(args)
 
     # Feature scaler from the training fold only. Fitting it on the whole dev
     # set would leak the fold's own validation rows into its normalisation.
@@ -376,8 +389,7 @@ def train_one_fold(args, fold, X, Fe, y, dev_idx, fold_of, test_idx, run_dir):
 
     # One reusable module for evaluating the EMA weights, rather than rebuilding
     # the whole network every epoch.
-    eval_model = build_model(args.preset, dropout=args.dropout,
-                             use_features=not args.no_features)
+    eval_model = net(args)
 
     for epoch in range(args.epochs):
         model.train()
@@ -449,8 +461,7 @@ def train_one_fold(args, fold, X, Fe, y, dev_idx, fold_of, test_idx, run_dir):
 
     # Reload the best checkpoint for the fold's final predictions.
     ckpt = torch.load(os.path.join(fold_dir, "best.pt"), weights_only=False)
-    final = build_model(args.preset, dropout=args.dropout,
-                        use_features=not args.no_features)
+    final = net(args)
     final.load_state_dict(ckpt["state_dict"])
 
     val_prob = evaluate(final, X, Fe, va_idx, args.eval_batch, args.tta, args.bf16)
@@ -562,6 +573,16 @@ def main(argv=None):
 
     X, Fe, y, split, records, ok = load_cache(args.cache, mmap=args.mmap)
 
+    global IN_CH, N_FEAT
+    IN_CH = int(X.shape[1])
+    N_FEAT = int(Fe.shape[1])
+    if IN_CH != 12:
+        print("cache %d kanalli (12 derivasyon + %d ek kanal)"
+              % (IN_CH, IN_CH - 12))
+    if N_FEAT != N_FEATURES:
+        print("cache %d ozellikli (%d + %d ek olcum)"
+              % (N_FEAT, N_FEATURES, N_FEAT - N_FEATURES))
+
     usable = ok & (y >= 0)
     dev_idx = np.flatnonzero(np.isin(split, DEV_SPLITS) & usable)
     test_idx = np.flatnonzero((split == TEST_SPLIT) & usable)
@@ -571,7 +592,7 @@ def main(argv=None):
     fold_of = make_folds(y[dev_idx], args.folds, args.seed)
 
     print("preset=%s params=%s cache=%s" % (
-        args.preset, "{:,}".format(count_parameters(build_model(args.preset))),
+        args.preset, "{:,}".format(count_parameters(net(args))),
         args.cache))
     print("gelistirme=%d  test_public=%d  fold=%d  epoch=%d  bf16=%s"
           % (len(dev_idx), len(test_idx), args.folds, args.epochs, args.bf16))
@@ -631,7 +652,7 @@ def main(argv=None):
     summary = {
         "tag": args.tag, "preset": args.preset, "cache": args.cache,
         "folds": args.folds, "epochs": args.epochs, "seed": args.seed,
-        "params": count_parameters(build_model(args.preset)),
+        "params": count_parameters(net(args)),
         "oof_macro_f1": oof_f1, "oof_per_class": oof_per_class,
         "oof_afib_afl": oof_pair,
         "test_macro_f1": test_f1, "test_per_class": test_per_class,
@@ -673,8 +694,7 @@ def train_full(args, X, Fe, y, dev_idx, results, run_dir):
     torch.manual_seed(args.seed + 999)
     np.random.seed(args.seed + 999)
 
-    model = build_model(args.preset, dropout=args.dropout,
-                        use_features=not args.no_features)
+    model = net(args)
     model.set_feature_scaler(Fe[dev_idx].mean(axis=0), Fe[dev_idx].std(axis=0))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     ema = EMA(model, decay=args.ema)
@@ -718,8 +738,7 @@ def train_full(args, X, Fe, y, dev_idx, results, run_dir):
         print("  full ep %2d/%d  %.0fs" % (epoch + 1, epochs, time.time() - t_epoch),
               flush=True)
 
-    final = build_model(args.preset, dropout=args.dropout,
-                        use_features=not args.no_features)
+    final = net(args)
     final.load_state_dict(ema.state_dict(model))
     torch.save({"state_dict": final.state_dict(), "preset": args.preset,
                 "dropout": args.dropout, "use_features": not args.no_features,

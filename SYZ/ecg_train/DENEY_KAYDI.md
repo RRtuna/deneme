@@ -230,3 +230,67 @@ değişen tek şey, fold 0 OOF, 5-fold OOF, 5-fold test, karar.
 **Kural:** her satırda **tek bir şey** değişsin. Fold'lar arası oynaklık
 ±0.015 olduğu için, karar vermek için **≥0.01 fark** iste; altındakine gürültü
 de ve geç.
+
+---
+
+## Zor sentetik kıyas kümesi üzerinde eleme (2026-09-04)
+
+Amaç: fikirleri **senin makineni günlerce meşgul etmeden** elemek. Bunun için
+Bayes tavanı analitik olarak bilinen bir kıyas kümesi üretildi
+(`tools/make_synth_hard.py`): AFIB/AFL ayrımı gizli bir θ değişkenine bağlı,
+iki sınıfın θ dağılımları örtüşüyor. Örtüşme miktarı bilindiği için
+"mükemmel bir model en fazla ne yapabilir" hesaplanabiliyor.
+
+`cache_hard`: 1750 kayıt, 1489 geliştirme, **Bayes ikili tavanı 0.8408**.
+Referans koşu `hb_base`: OOF macro-F1 0.9181, AFIB/AFL **0.7965** — yani gerçek
+projedeki 0.7376 ile aynı rejim, ölçülebilir boşluk var.
+
+Karar aracı `tools/compare_runs.py`: iki koşuyu **eşleştirilmiş** McNemar /
+işaret testiyle karşılaştırır. Yan yana skor okumak yerine yalnızca fikrini
+değiştiren kayıtlara bakar.
+
+| # | fikir | AFIB/AFL | düzelen/bozulan | p | karar |
+|---|---|---|---|---|---|
+| S1 | mixup AFIB↔AFL çiftini karıştırmasın (`--mixup_no_pair`) | 0.8000 | 22 / 19 | 0.755 | **RED** |
+| S2 | mixup tamamen kapalı (`--mixup 0`) | 0.8000 | 22 / 19 | 0.755 | **RED** |
+
+S1'in hipotezi "mixup tam da keskin olması gereken sınırı bulanıklaştırıyor"
+idi. S2 kontrolü bunu çürüttü: mixup'ı **tamamen** kapatmak ile yalnızca çifti
+korumak aynı sonucu verdi. Yani mixup bu ikilide ne zarar veriyor ne fayda —
+kaldıraç değil. Yama gönderilmedi.
+
+### S3 — QRST iptalli atriyal bant artığı (POZİTİF)
+
+Mevcut 37 özellikteki flutter ölçümleri (`flutter_power_ii`,
+`flutter_peak_freq`, `flutter_concentration`, `flutter_autocorr`,
+`fwave_amp_v1`) **ham sinyal** üzerinde hesaplanıyor. 75 bpm'de QRS treninin
+harmonikleri 1.25 / 2.5 / 3.75 / **5.0 / 6.25** Hz'e düşüyor — tam flutter
+bandının üstüne. Yani o özellikler büyük ölçüde QRS ölçüyor.
+
+Yapılan: R tepelerine hizalı medyan şablon vuruş başına en küçük karelerle
+ölçeklenip çıkarıldı, kalan artık 2.5–12 Hz bandına sınırlandı, 4 derivasyondan
+(II, III, aVF, V1) 5'er ölçüm alındı → 20 sayı. Bu 20 sayıya **düz lojistik
+regresyon** takıldı (ağın kendi fold'ları, fold-dışı).
+
+| | AFIB/AFL |
+|---|---|
+| ağ (2.3 M parametre, 12 derivasyon ham sinyal) | 0.7976 |
+| bant-artık probu (20 sayı + lojistik regresyon) | 0.7835 |
+| **harman (w=0.5)** | **0.8176** |
+| Bayes tavanı | 0.8408 |
+
+Aynı tahmin oranı 0.8235 (çeşitlilik kapısı 0.85'in altında).
+Kurtarılabilir 150 kayıt; yalnızca 103 kayıtta ikisi de yanılıyor.
+Harman, kalan boşluğun **%46'sını** kapatıyor. macro-F1 0.9181 → 0.9263
+(**+0.0081**).
+
+Bu, sentetik kümede ölçüldü; gerçek veride geçerli olduğunu **kanıtlamaz**.
+Gerçek veride eğitimsiz doğrulama için `resid_probe.py` yazıldı (~20 sn).
+
+### Gerçek veride koşulacak (eğitim gerektirmez)
+
+| # | komut | süre | ne söyler |
+|---|---|---|---|
+| P1 | `python resid_probe.py --cache cache --oof ensemble_oof_prob.npy --run runs/<ana koşu>` | ~20 sn | harman kazancı, kurtarılabilir sayısı, KARAR |
+
+**Kapı:** macro-F1 kazancı > 0.02 → uygula; 0.008–0.02 → sınırda; < 0.008 → bırak.
