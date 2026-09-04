@@ -326,3 +326,64 @@ eğitimdekiyle birebir aynı. Ek maliyet **3.8 ms/kayıt**.
 atriyal dalga temiz bir bant sınırlı süreç, RR aralıkları da tam katlar — yani
 ölçüm **iyimser**. Gerçek veride kazanç daha küçük olacaktır. P1 bunu 20 saniyede,
 eğitim yapmadan söyler.
+
+### P1 SONUCU — GERÇEK VERİ: **+0.0006 → REDDEDİLDİ**
+
+Doğru fold üyeliğiyle (`--run`) koşuldu. Kazanç **+0.0006**, kapının (0.008)
+çok altında.
+
+Sentetik kümedeki +0.0132 **döngüsel bir ölçümdü**: jeneratörü ben yazmıştım ve
+atriyal dalgayı tam da bu özelliklerin ölçtüğü biçimde kodluyordu. Yukarıdaki
+"dürüst uyarı" doğru çıktı, ama tahmin ettiğimden de sert biçimde.
+
+**Ne öğrenildi:** mevcut 37 özellikteki flutter ölçümleri, QRS harmonik
+kirlenmesine rağmen bu bilgiyi zaten yakalıyor. QRST iptali ek bir şey
+getirmiyor. Savunulabilir bir negatif sonuç: "atriyal sinyali QRS'ten ayırmayı
+denedik, mevcut özelliklerin ötesine geçmedi."
+
+**Maliyet: 20 saniye.** Kapı olmasaydı bu bir günlük yeniden eğitim olurdu.
+Kod depoda duruyor, teslime girmiyor.
+
+---
+
+## FAZ 5 — mimari çeşitliliği
+
+`model.py`'de yalnızca ResNet varyantları vardı (6 preset: r18, r34, r18k11,
+wide, w64, w80). `model_diverse.py` Inception1D ve CNN+Transformer hibritini
+**ayrı bir modül** olarak ekler. Mevcut `PRESETS`, `ECGNet` ve blok sınıfları
+ellenmez — bu yüzden eski checkpoint'ler `strict=True` ile yüklenmeye devam
+eder.
+
+```
+python tools/add_inception.py        # ekler, yedek alır, doğrular
+python train.py --preset inception --tag div_inc --only_fold 0 \
+    --epochs 30 --lr 0.002 --no_bf16
+```
+
+| preset | mimari | parametre |
+|---|---|---|
+| `inception` | paralel 11/21/41 çekirdek | 999 K |
+| `inception_w` | aynısı, geniş | 2.16 M |
+| `hybrid` | CNN + 2 katman Transformer | 1.25 M |
+
+### Kapı — tek başına skor DEĞİL
+
+Fold-0 bittikten sonra:
+
+```
+python check_diversity.py runs/<ana koşun> runs/div_inc --cache cache
+```
+
+Bakılacak sayı **KURTARILABILIR**: birinin bildiği, diğerinin bilmediği kayıt
+sayısı. Aynı tahmin oranı **< 0.85** ve kurtarılabilir **> 0** ise tam 5-fold
+koş; değilse bırak.
+
+Neden bu ölçüt: final ensemble'ın beş ailesi de ResNet'ti ve 30→20 budama
+denemesinde 10 model çıkarıldığında **750 tahminin hiçbiri değişmedi**. Tek
+başına daha kötü bir model ensemble'a katkı verebilir; önemli olan **farklı**
+yanılmasıdır.
+
+| # | komut | süre | fold0 OOF | aynı tahmin | kurtarılabilir | karar |
+|---|---|---|---|---|---|---|
+| D1 | `--preset inception --only_fold 0 --epochs 30 --lr 0.002` | | | | | |
+| D2 | `--preset hybrid --only_fold 0 --epochs 30 --lr 0.001` | | | | | |
