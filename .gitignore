@@ -34,3 +34,18 @@ SYNTH/
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# --- VERI SETI KULLANIM VE GIZLILIK TAAHHUTNAMESI, md. 2 ve 5 ---
+# Taahhutname "Veri Seti"ni ham kayitlarla sinirlamiyor: "bunlardan
+# turetilebilecek tum veri, dosya ve icerikleri" de kapsiyor ve GitHub'a
+# yuklenmesini acikca yasakliyor. Asagidakiler o yuzden burada.
+baseline/
+SYZ/ecg_train/baseline/
+resid_features.npy
+SYZ/ecg_train/resid_features.npy
+*.mat
+*.dat
+*.hea
+train.csv
+validation.csv
+test_public.csv
