@@ -57,6 +57,12 @@ def net(args):
 DEV_SPLITS = ("train", "validation")
 TEST_SPLIT = "test_public"
 
+# Disaridan eklenen kayitlarin split degeri. Bunlar HER fold'un EGITIM
+# kismina girer, hicbir fold'un dogrulamasina girmez. Boylece OOF skoru
+# yalnizca yarismanin kendi verisinde olculmeye devam eder ve onceki tum
+# deneylerle karsilastirilabilir kalir. `test_public`'e zaten hic dokunulmaz.
+EXTRA_SPLIT = "extra"
+
 
 # --------------------------------------------------------------------------
 # data
@@ -325,7 +331,8 @@ def evaluate(model, X, Fe, idx, batch=64, tta="shift3", autocast=False):
 # one fold
 # --------------------------------------------------------------------------
 
-def train_one_fold(args, fold, X, Fe, y, dev_idx, fold_of, test_idx, run_dir):
+def train_one_fold(args, fold, X, Fe, y, dev_idx, fold_of, test_idx, run_dir,
+                   extra_idx=np.array([], dtype=np.int64)):
     fold_dir = os.path.join(run_dir, "fold%d" % fold)
     os.makedirs(fold_dir, exist_ok=True)
     done_path = os.path.join(fold_dir, "done.json")
@@ -342,6 +349,12 @@ def train_one_fold(args, fold, X, Fe, y, dev_idx, fold_of, test_idx, run_dir):
 
     tr_idx = dev_idx[fold_of != fold]
     va_idx = dev_idx[fold_of == fold]
+
+    # Dis kayitlar: her fold'un egitimine eklenir, dogrulamaya asla girmez.
+    if len(extra_idx):
+        tr_idx = np.concatenate([tr_idx, extra_idx])
+        print("  dis veri: egitime %d kayit eklendi (dogrulama %d kayit, "
+              "yalnizca yarisma verisi)" % (len(extra_idx), len(va_idx)))
 
     if args.exclude:
         excluded = set(np.load(args.exclude).tolist())
@@ -587,6 +600,10 @@ def main(argv=None):
     usable = ok & (y >= 0)
     dev_idx = np.flatnonzero(np.isin(split, DEV_SPLITS) & usable)
     test_idx = np.flatnonzero((split == TEST_SPLIT) & usable)
+    extra_idx = np.flatnonzero((split == EXTRA_SPLIT) & usable)
+    if len(extra_idx):
+        print("dis veri: %d kayit (yalnizca egitim fold'larina girer)"
+              % len(extra_idx))
     if len(dev_idx) == 0:
         raise SystemExit("development set is empty")
 
@@ -606,7 +623,7 @@ def main(argv=None):
     for fold in folds:
         print("\n--- fold %d/%d ---" % (fold, args.folds))
         results.append(train_one_fold(args, fold, X, Fe, y, dev_idx, fold_of,
-                                      test_idx, run_dir))
+                                      test_idx, run_dir, extra_idx))
 
     with open(os.path.join(run_dir, "args.json"), "w") as fh:
         json.dump({k: v for k, v in vars(args).items()}, fh, indent=2)

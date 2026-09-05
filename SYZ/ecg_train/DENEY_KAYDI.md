@@ -387,3 +387,62 @@ yanılmasıdır.
 |---|---|---|---|---|---|---|
 | D1 | `--preset inception --only_fold 0 --epochs 30 --lr 0.002` | | | | | |
 | D2 | `--preset hybrid --only_fold 0 --epochs 30 --lr 0.001` | | | | | |
+
+---
+
+## Şartname okundu — dış veri SERBEST (2026-09-05)
+
+TEKNOFEST şartnamesi ve veri taahhütnamesi incelendi.
+
+**§3.1.1:** "Yarışmacılar erişime açık olan farklı veri setlerini ve/veya kendi
+oluşturacakları veri setlerini de model eğitimi için kullanabileceklerdir."
+**§1:** "verilen veri setleri ile birlikte açık veri kaynaklarını da kullanarak"
+**§7.7:** "Lise seviyesi için PSR aşamasında veri paylaşımı yapılmayacaktır.
+Yarışmacılar açık veri setlerinden yararlanacaklardır."
+
+Kaynağın adı da şartnamede: **PhysioNet ECG Arrhythmia Dataset 1.0.0**
+(~45.000 kayıt, 12 derivasyon, 500 Hz, SNOMED-CT). Yarışma kümesi bu kaynakla
+aynı etiketleme düzenini kullanıyor → "etiket konvansiyonu uyuşmuyor" riski yok.
+
+### §7.2 — asıl bulgu: final skoru test_public'te ölçülmüyor
+
+"Final aşamasında **external validasyon** yapılacaktır. TEKNOFEST için özgün ve
+tamamen anonimleştirilmiş **yeni bir EKG veri seti** kullanılacaktır...
+**genelleme yeteneğini** değerlendirmek amacıyla." Final %90, sunum %10.
+
+Bu, optimizasyon hedefini değiştiriyor: 750 kayıtlık `test_public`'te son 0.01'i
+kovalamak değil, **cross-dataset genelleme**. Elenen kaldıraçların hepsi birinci
+türdendi.
+
+### Taahhütname — depo denetimi
+
+md. 5 veri setinin GitHub'a yüklenmesini yasaklıyor; md. 2 "Veri Seti"ni
+türetilmiş dosyaları da kapsayacak şekilde tanımlıyor. **Depo denetlendi:**
+42 takipli dosyanın tamamı `.py` ve `.md`, hiçbir kayıt/cache/`.npy`/ağırlık
+izlenmiyor. `.gitignore`'a `baseline/`, `resid_features.npy`, ham kayıt
+uzantıları ve split csv'leri eklendi.
+
+### E1 — dış veri ekleme (koşulacak)
+
+`tools/add_external.py`. Tasarım kararları:
+
+- Eklenen kayıtlar `split="extra"` alır; `train.py` bunları **her fold'un
+  eğitimine** koyar, **hiçbir fold'un doğrulamasına** koymaz. OOF hâlâ yalnızca
+  yarışma verisinde ölçülür → mevcut koşularla doğrudan karşılaştırılabilir.
+- Etiket haritası tahmin edilmez, **senin verinden türetilir** (çakışan
+  kayıtların SNOMED kodlarından). Ortüşme < 50 ise yerleşik tabloya düşer ve
+  uyarır.
+- **Üç kademeli sızıntı taraması:** kayıt adı → şekil imzası (kazanç/ofset
+  duyarsız) → korelasyon ≥ 0.995 (yeniden örnekleme/kırpma yakalar).
+
+**Sızıntı testi:** `test_public`'ten alınıp yeniden adlandırılmış 12 kaydın
+**12'si de** yakalandı, 0 sızıntı. 76 gerçek yeni kayıt kabul edildi. Yazma ve
+eğitim yolu uçtan uca koşuldu.
+
+Yönerge: `DIS_VERI.md`.
+
+| # | komut | kapı |
+|---|---|---|
+| E1a | `python tools/add_external.py --source <klasör> --cache cache --out cache_ext --dry-run` | etiket haritası doğru mu, kaç sızıntı yakalandı |
+| E1b | aynısı `--dry-run` olmadan, `--per-class N` ile | — |
+| E1c | `python train.py --cache cache_ext --tag ext ...` | OOF > mevcut, `compare_runs.py` p < 0.05 |
