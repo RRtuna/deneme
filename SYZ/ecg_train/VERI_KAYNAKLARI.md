@@ -65,26 +65,61 @@ ayrı indirmenin tek avantajı SCP-ECG alt etiketlerine erişim. **AFL yalnızca
 
 ---
 
-## Tier 2 — değerli ama dönüştürme işi var
+## Tier 1.5 — dönüştürme işi var ama küçük
 
 ### Shandong Provincial Hospital (SPH)
 
 https://data.mendeley.com/datasets/dvb5mnhfc4/1 — 25.770 kayıt / 24.666 hasta,
-500 Hz, 10–60 sn, **açık erişim** (Mendeley, kayıt gerektirmez).
+500 Hz, 10–60 sn, **tamamen açık erişim** (Mendeley, kayıt/onay yok).
 
-Ama: etiketler **AHA/ACC/HRS ifadeleri**, SNOMED değil (44 ana ifade + 15
-niteleyici). Format WFDB değil. Yani hem etiket eşlemesi hem dosya dönüştürücü
-yazman gerekir. AFL sayısını doğrulamadım.
+Format: her kayıt bir HDF5 dosyası (12 × L, 16-bit, `A00001.h5`), yanında
+`attributes.csv` (üst veri) ve `code.csv` (AHA ifade sözlüğü).
 
-**5 günde yapılacak iş değil.** Yarışma sonrası için not al.
+İş yükü: etiketler SNOMED değil **AHA/ACC/HRS ifadeleri**, dosyalar WFDB değil.
+Yani bir okuyucu + etiket eşlemesi gerekiyor — **birkaç saatlik iş**, hafta
+değil. (Bu belgenin ilk sürümünde bunu MIMIC'le aynı kefeye koyup "5 güne
+sığmaz" demiştim; yanlıştı.)
+
+**Asıl değeri:** Challenge 2021 havuzunda olmayan, senin verinde de bulunmayan
+**bambaşka bir hastane ve popülasyon** (Şandong, 2019–2020). Final
+değerlendirmesi §7.2'ye göre yeni bir veri setinde yapılacağı için, tam olarak
+ödüllendirilen çeşitlilik türü budur.
+
+**Bilinmeyen:** kaç AFL kaydı olduğu. Bu, işe değip değmeyeceğini belirleyen tek
+sayı — ve 25.770 dosyayı indirmeden öğrenilebilir. Mendeley'den yalnızca
+`attributes.csv` ve `code.csv` dosyalarını indir, sonra:
+
+```
+python tools/sph_probe.py --dir <o iki csv'nin klasörü>
+```
+
+Kolon adlarını ve ayracı çalışma anında keşfeder, AHA ifadelerini anahtar
+kelimeyle senin 5 sınıfına eşler, tek etiketli kayıt sayılarını basar.
+
+| AFL sayısı | karar |
+|---|---|
+| ≥ 500 | dönüştürücüyü yaz, değer |
+| 150–500 | sınırda; Challenge 2021 işi bittikten sonra |
+| < 150 | bırak — Challenge 2021'de zaten ~7.800 eklenebilir AFL var |
+
+---
+
+## Tier 2 — erişim kapısı haftalar sürer
 
 ### MIMIC-IV-ECG
 
-Senin verinde zaten var (kayıtlarının %40'ı), ama PhysioNet'te **credentialed**
-erişimli: CITI "Data or Specimens Only Research" eğitimi + başvuru onayı.
-Süreç haftalar sürer. **5 güne sığmaz.**
+Senin verinde zaten var (kayıtlarının ~%40'ı), ama PhysioNet'te
+**credentialed** erişimli. Gecikme teknik değil, insan onayı:
 
----
+1. PhysioNet hesabı — dakikalar
+2. CITI "Data or Specimens Only Research" eğitimi — ~6–9 saatlik modüller
+3. **Referanslı credentialing başvurusu** — bir danışmanın kefil olması ve
+   PhysioNet'in doğrulama e-postasına cevap vermesi gerekir
+4. **PhysioNet personelinin manuel incelemesi** — günlerden haftalara
+5. Veri setine özel kullanım sözleşmesi
+
+Bekleme 3. ve 4. adımda ve senin hızlandıramayacağın yerde. Lise öğrencisi
+için referans şartı ayrıca gerçek bir engel. **5 güne sığmaz.**
 
 ## Tier 3 — senin problemin için işe yaramaz
 
