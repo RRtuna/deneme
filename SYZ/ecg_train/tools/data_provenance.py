@@ -61,6 +61,14 @@ PREFIXES = (
     ("E", "Georgia"),
 )
 
+# Ad onegi olmayan kaynaklar yol/klasor adindan cozulur.
+PATH_KEYS = (
+    ("mimic", "MIMIC-IV-ECG"), ("ptb-xl", "PTB-XL"), ("ptb_xl", "PTB-XL"),
+    ("ningbo", "Ningbo"), ("chapman", "Chapman-Shaoxing"), ("shaoxing", "Chapman-Shaoxing"),
+    ("georgia", "Georgia"), ("cpsc", "CPSC"), ("incart", "INCART"),
+    ("st_petersburg", "INCART"), ("ptb", "PTB"),
+)
+
 # JS kayitlarinda Chapman-Shaoxing 10.646 kayittir; sonrasi Ningbo.
 JS_SPLIT = 10646
 
@@ -90,12 +98,7 @@ def source_of(record, path=""):
     # Ad taninmadi: klasor adindan tahmin et.
     if path:
         parts = [p.lower() for p in os.path.normpath(path).split(os.sep)]
-        for key, name in (("ptb-xl", "PTB-XL"), ("ptb_xl", "PTB-XL"),
-                          ("ningbo", "Ningbo"),
-                          ("chapman", "Chapman-Shaoxing"),
-                          ("georgia", "Georgia"), ("cpsc", "CPSC"),
-                          ("incart", "INCART"), ("st_petersburg", "INCART"),
-                          ("ptb", "PTB")):
+        for key, name in PATH_KEYS:
             if any(key in p for p in parts):
                 return name
     return "?"
