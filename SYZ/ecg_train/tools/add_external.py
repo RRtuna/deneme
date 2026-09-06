@@ -61,6 +61,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ecg_preprocess as ep  # noqa: E402
 import wfdb_lite as wl       # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from data_provenance import source_of  # noqa: E402
+
 # Yalnizca ortusme bulunamazsa kullanilir. PhysioNet/CinC 2020-2021
 # esleniklerini icerir; dogrulanmis degildir, bu yuzden uyari basilir.
 FALLBACK_SNOMED = {
@@ -157,6 +160,12 @@ def main(argv=None):
     ap.add_argument("--only", default="",
                     help="yalnizca bu siniflar, virgulle (or. AFIB,AFL)")
     ap.add_argument("--corr-gate", type=float, default=CORR_GATE)
+    ap.add_argument("--only-source", default="",
+                    help="yalnizca bu kaynaklardan al, virgulle "
+                         "(or. PTB-XL,Georgia,CPSC). Kaynak-sinif "
+                         "karisikligini kirmak icin kullanilir.")
+    ap.add_argument("--exclude-source", default="",
+                    help="bu kaynaklari atla, virgulle (or. Ningbo)")
     ap.add_argument("--single-label", action="store_true", default=True,
                     help="yalnizca TEK hedef tani tasiyan kayitlari al (varsayilan)")
     ap.add_argument("--allow-multi", dest="single_label", action="store_false",
@@ -279,6 +288,12 @@ def main(argv=None):
     # ---- 3) adaylari sec + cakisma taramasi -------------------------------
     print()
     print("3/4  aday secimi ve cakisma taramasi")
+    only_src = {t.strip() for t in args.only_source.split(",") if t.strip()}
+    excl_src = {t.strip() for t in args.exclude_source.split(",") if t.strip()}
+    if only_src:
+        print("     yalnizca kaynaklar: %s" % ", ".join(sorted(only_src)))
+    if excl_src:
+        print("     dislanan kaynaklar: %s" % ", ".join(sorted(excl_src)))
     cand, skipped = [], Counter()
     for h in hea:
         codes = dx_codes(h)
@@ -299,7 +314,14 @@ def main(argv=None):
         if stem(h) in own_stem:
             skipped["ad cakismasi (senin kaydin)"] += 1
             continue
-        cand.append((h, lab))
+        src = source_of(stem(h).upper(), h)
+        if only_src and src not in only_src:
+            skipped["kaynak istenmedi (%s)" % src] += 1
+            continue
+        if src in excl_src:
+            skipped["kaynak dislandi (%s)" % src] += 1
+            continue
+        cand.append((h, lab, src))
 
     print("     aday: %d kayit" % len(cand))
     for k, v in skipped.most_common():
@@ -321,7 +343,7 @@ def main(argv=None):
         C = M @ OWN.T                           # (b, n_own) korelasyon
         best = C.max(axis=1)
         arg = C.argmax(axis=1)
-        for k, (h, lab, sig, fs) in enumerate(bufmeta):
+        for k, (h, lab, sig, fs, src) in enumerate(bufmeta):
             if best[k] >= args.corr_gate:
                 dup_corr += 1
                 if dup_corr <= 5:
@@ -329,11 +351,11 @@ def main(argv=None):
                           % (os.path.basename(h), own_split[arg[k]],
                              own_label[arg[k]], best[k]))
                 continue
-            accepted.append((h, lab, sig, fs))
+            accepted.append((h, lab, sig, fs, src))
         buf.clear()
         bufmeta.clear()
 
-    for n, (h, lab) in enumerate(cand):
+    for n, (h, lab, src) in enumerate(cand):
         try:
             sig, fs = load_signal(h)
         except Exception:                        # noqa: BLE001
@@ -344,7 +366,7 @@ def main(argv=None):
             dup_shape += 1
             continue
         buf.append(v)
-        bufmeta.append((h, lab, sig, fs))
+        bufmeta.append((h, lab, sig, fs, src))
         if len(buf) >= BATCH:
             flush()
         if (n + 1) % 2000 == 0:
@@ -369,10 +391,23 @@ def main(argv=None):
     print()
     print("%-8s %10s %10s %10s" % ("sinif", "senin", "eklenen", "toplam"))
     own_cnt = Counter(own_label)
-    add_cnt = Counter(lab for _h, lab, _s, _f in accepted)
+    add_cnt = Counter(lab for _h, lab, _s, _f, _q in accepted)
     for c in classes:
         print("%-8s %10d %10d %10d" % (c, own_cnt[c], add_cnt[c],
                                        own_cnt[c] + add_cnt[c]))
+
+    by_src = defaultdict(Counter)
+    for _h, lab, _s, _f, src in accepted:
+        by_src[src][lab] += 1
+    if by_src:
+        print()
+        print("EKLENECEKLERIN KAYNAK x SINIF DAGILIMI")
+        srcs = sorted(by_src, key=lambda s: -sum(by_src[s].values()))
+        print("%-20s" % "kaynak" + "".join("%9s" % c for c in classes) + "%9s" % "toplam")
+        for sname in srcs:
+            print("%-20s" % sname
+                  + "".join("%9d" % by_src[sname][c] for c in classes)
+                  + "%9d" % sum(by_src[sname].values()))
 
     if args.dry_run:
         print()
@@ -406,7 +441,7 @@ def main(argv=None):
 
     t0 = time.time()
     bad = []
-    for k, (h, lab, sig, fs) in enumerate(accepted):
+    for k, (h, lab, sig, fs, src) in enumerate(accepted):
         i = n_old + k
         try:
             X[i] = ep.preprocess_signal(sig, fs, target_fs=target_fs)
@@ -429,7 +464,7 @@ def main(argv=None):
         for i, r in enumerate(rows):
             w.writerow([i, r["record"], r.get("path", ""), r["label"],
                         r.get("label_name", ""), r["split"], r.get("ok", 1)])
-        for k, (h, lab, _s, _f) in enumerate(accepted):
+        for k, (h, lab, _s, _f, _q) in enumerate(accepted):
             w.writerow([n_old + k, stem(h), h, classes.index(lab), lab,
                         "extra", int(h not in bad_paths)])
 
@@ -446,6 +481,8 @@ def main(argv=None):
         "dup_by_corr": dup_corr,
         "corr_gate": args.corr_gate,
         "single_label_only": args.single_label,
+        "per_source": {k: dict(v) for k, v in by_src.items()},
+        "only_source": sorted(only_src), "exclude_source": sorted(excl_src),
     }
     meta["n_records"] = n_new
     with open(os.path.join(args.out, "meta.json"), "w") as fh:
