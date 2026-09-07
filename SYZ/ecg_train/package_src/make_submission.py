@@ -341,7 +341,11 @@ def main(argv=None):
             print("  - %s" % e)
         return 1
 
-    out = args.out or ("TEAM_%s_FINAL.json" % args.team_id)
+    # Kilavuz onerisi: TEAM_<TAKIM_ID>_FINAL.json. team_id zaten "TEAM_"
+    # ile basliyorsa oneki iki kez yazma -> TEAM_TEAM_001_FINAL.json olmasin.
+    tid = args.team_id
+    stem = tid if tid.upper().startswith("TEAM_") else "TEAM_%s" % tid
+    out = args.out or ("%s_FINAL.json" % stem)
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, ensure_ascii=False, allow_nan=False,
                   separators=(",", ":"))
