@@ -50,6 +50,35 @@ SKIP_DIRS = ("__pycache__", ".git", ".ipynb_checkpoints")
 
 SUBMISSION = "make_submission.py"
 
+# --------------------------------------------------------------------------
+# Manifest semasi -- eski/yeni ve Turkce/Ingilizce anahtarlarin ikisi de kabul
+# --------------------------------------------------------------------------
+# Ayni bilgi farkli export.py surumlerinde farkli adlarla yazilmis olabilir.
+# Sabit tek bir anahtar beklemek, calisan bir paketi "bozuk" ilan eder.
+MODELS_KEYS = ("models", "modeller", "uyeler", "members")
+FILE_KEYS   = ("file", "dosya", "path", "yol")
+SHA_KEYS    = ("sha256", "sha", "sha256sum", "saglama", "hash")
+MEMBER_KEYS = ("member", "kosu", "uye", "name", "ad")
+WEIGHT_KEYS = ("weight", "agirlik", "w")
+
+
+def pick(d, keys, default=None):
+    """Sozlukten ilk bulunan anahtarin degerini dondur."""
+    if isinstance(d, dict):
+        for k in keys:
+            if k in d and d[k] not in (None, ""):
+                return d[k]
+    return default
+
+
+def manifest_models(manifest):
+    """(girdi listesi, kullanilan anahtar). Bulunamazsa ([], None)."""
+    for k in MODELS_KEYS:
+        v = manifest.get(k)
+        if isinstance(v, list) and v:
+            return v, k
+    return [], None
+
 
 def die(msg):
     print()
@@ -124,7 +153,8 @@ def write_docs(dest, manifest):
 
     readme = os.path.join(dest, "README_TESLIM.md")
     if not os.path.exists(readme):
-        n = len(manifest.get("models") or [])
+        n, _k = manifest_models(manifest)
+        n = len(n)
         with open(readme, "w", encoding="utf-8") as fh:
             fh.write("""# Yarisma teslim paketi
 
@@ -176,64 +206,133 @@ Yarisma test verisi bu pakete dahil DEGILDIR ve edilmemelidir.
     return made
 
 
-def verify(dest, source, strict_sha=True):
-    """Yapiyi, model sayisini ve saglamalari denetle. Hata listesi dondurur."""
+def verify(dest, source):
+    """Yapiyi, model sayisini ve (varsa) saglamalari denetle.
+
+    Dondurur: (errs, warns, info) -- info ekranda basilacak olgular.
+    """
     errs, warns = [], []
+    info = {}
 
     for f in REQUIRED + (SUBMISSION,):
-        if not os.path.exists(os.path.join(dest, f)):
+        info["var_" + f] = os.path.exists(os.path.join(dest, f))
+        if not info["var_" + f]:
             errs.append("eksik dosya: %s" % f)
+    for f in ("requirements.txt", "README_TESLIM.md"):
+        info["var_" + f] = os.path.exists(os.path.join(dest, f))
     if errs:
-        return errs, warns
+        return errs, warns, info
 
     models_dir = os.path.join(dest, "models")
     if not os.path.isdir(models_dir):
-        return ["models/ klasoru yok"], warns
+        return ["models/ klasoru yok"], warns, info
 
     on_disk = sorted(f for f in os.listdir(models_dir)
                      if f.lower().endswith(".onnx"))
+    info["onnx_disk"] = len(on_disk)
+
     try:
         manifest = json.load(open(os.path.join(dest, "manifest.json"),
                                   encoding="utf-8"))
     except Exception as exc:                     # noqa: BLE001
-        return ["manifest.json okunamadi: %s" % exc], warns
+        return ["manifest.json okunamadi: %s" % exc], warns, info
 
-    entries = manifest.get("models") or []
+    entries, mkey = manifest_models(manifest)
+    info["manifest_key"] = mkey
+    info["manifest_n"] = len(entries)
     if not entries:
-        errs.append("manifest.json icinde model listesi yok")
+        errs.append("manifest.json icinde model listesi yok "
+                    "(su anahtarlar arandi: %s)" % ", ".join(MODELS_KEYS))
+        return errs, warns, info
 
-    listed = []
-    for e in entries:
-        rel = (e.get("file") or "").replace("\\", "/")
+    listed, sha_checked, sha_missing = [], 0, 0
+    fkey_used = set()
+    for n, e in enumerate(entries):
+        rel = pick(e, FILE_KEYS)
         if not rel:
-            errs.append("manifest girdisinde 'file' yok: %s" % e.get("member"))
+            errs.append("manifest girdisi %d icinde dosya yolu yok "
+                        "(arananlar: %s)" % (n, ", ".join(FILE_KEYS)))
             continue
-        listed.append(os.path.basename(rel))
+        for k in FILE_KEYS:
+            if isinstance(e, dict) and k in e:
+                fkey_used.add(k)
+                break
+        rel = str(rel).replace("\\", "/")
+        base = os.path.basename(rel)
+        listed.append(base)
         p = os.path.join(dest, *rel.split("/"))
         if not os.path.exists(p):
-            errs.append("manifest'te var ama diskte yok: %s" % rel)
-            continue
-        want = e.get("sha256")
+            # yol farkli olabilir; models/ altinda ada gore ara
+            alt = os.path.join(models_dir, base)
+            if os.path.exists(alt):
+                p = alt
+            else:
+                errs.append("manifest'te var ama diskte yok: %s" % rel)
+                continue
+        want = pick(e, SHA_KEYS)
         if want:
             got = sha256(p)
             if got != want:
-                (errs if strict_sha else warns).append(
-                    "SAGLAMA TUTMUYOR: %s\n      manifest %s\n      dosya   %s"
-                    % (rel, want, got))
+                errs.append("SAGLAMA TUTMUYOR: %s\n      manifest %s\n"
+                            "      dosya   %s" % (base, want, got))
+            else:
+                sha_checked += 1
+        else:
+            sha_missing += 1
 
-    extra = sorted(set(on_disk) - set(listed))
-    for x in extra:
+    info["file_key"] = ", ".join(sorted(fkey_used)) or "?"
+    info["sha_checked"] = sha_checked
+    info["sha_missing"] = sha_missing
+
+    missing_on_disk = sorted(set(listed) - set(on_disk))
+    extra_on_disk = sorted(set(on_disk) - set(listed))
+    info["eslesme"] = not missing_on_disk and not extra_on_disk
+    for x in missing_on_disk:
+        errs.append("manifest'te listelenmis ama models/ icinde yok: %s" % x)
+    for x in extra_on_disk:
         warns.append("models/ icinde manifest'te olmayan dosya: %s" % x)
 
-    # Kaynakla hedef ayni sayida ONNX tasiyor mu
     src_models = os.path.join(source, "models")
     if os.path.isdir(src_models):
         n_src = len([f for f in os.listdir(src_models)
                      if f.lower().endswith(".onnx")])
+        info["onnx_kaynak"] = n_src
         if n_src != len(on_disk):
             errs.append("kaynakta %d ONNX var, kopyada %d" % (n_src, len(on_disk)))
 
-    return errs, warns
+    return errs, warns, info
+
+
+def report(info, errs, warns):
+    """Kullanicinin istedigi dogrulama satirlarini acikca bas."""
+    def line(ok, text):
+        print("  [%s] %s" % ("OK" if ok else "!!", text))
+
+    n_disk = info.get("onnx_disk", 0)
+    n_man = info.get("manifest_n", 0)
+    line(n_disk > 0, "%d ONNX bulundu" % n_disk)
+    line(n_man > 0, "manifestte %d model bulundu   (anahtar: %s / %s)"
+         % (n_man, info.get("manifest_key"), info.get("file_key")))
+    line(bool(info.get("eslesme")),
+         "diskteki ve manifestteki model listeleri birebir eslesiyor"
+         if info.get("eslesme") else
+         "disk ve manifest listeleri ESLESMIYOR")
+    line(all(info.get("var_" + f) for f in REQUIRED),
+         "kritik Python/JSON dosyalari mevcut (%s)" % ", ".join(REQUIRED))
+    line(info.get("var_" + SUBMISSION), "%s mevcut" % SUBMISSION)
+    line(info.get("var_requirements.txt"), "requirements.txt mevcut")
+    line(info.get("var_README_TESLIM.md"), "README_TESLIM.md mevcut")
+
+    sc, sm = info.get("sha_checked", 0), info.get("sha_missing", 0)
+    if sc:
+        print("  [OK] SHA-256: %d model dogrulandi" % sc)
+    if sm:
+        print("  [--] SHA-256 manifestte yok, atlandi (%d model)" % sm)
+
+    for w in warns:
+        print("  UYARI: %s" % w)
+    for e in errs:
+        print("  HATA : %s" % e)
 
 
 def main(argv=None):
@@ -268,14 +367,14 @@ def main(argv=None):
     if args.check:
         if not os.path.isdir(dest):
             die("%s yok -- once --check olmadan calistir" % dest)
-        errs, warns = verify(dest, source)
-        for w in warns:
-            print("  UYARI: %s" % w)
+        errs, warns, info = verify(dest, source)
+        print("DOGRULAMA")
+        report(info, errs, warns)
+        print()
         if errs:
-            for e in errs:
-                print("  HATA : %s" % e)
+            print("PAKET TESLIME HAZIR DEGIL")
             return 1
-        print("all checks passed")
+        print("PAKET TESLIME HAZIR")
         return 0
 
     # ---- kaynak denetimi --------------------------------------------------
@@ -334,25 +433,16 @@ def main(argv=None):
     # ---- dogrulama --------------------------------------------------------
     print()
     print("DOGRULAMA")
-    errs, warns = verify(dest, source)
-    for w in warns:
-        print("  UYARI: %s" % w)
+    errs, warns, info = verify(dest, source)
+    report(info, errs, warns)
     if errs:
-        for e in errs:
-            print("  HATA : %s" % e)
         print()
-        print("Paket EKSIK ya da BOZUK. --force ile sifirdan kurmayi dene.")
+        print("PAKET TESLIME HAZIR DEGIL. --force ile sifirdan kurmayi dene.")
         return 1
 
-    models_dir = os.path.join(dest, "models")
-    n_onnx = len([f for f in os.listdir(models_dir) if f.lower().endswith(".onnx")])
     total = sum(os.path.getsize(os.path.join(dp, f))
                 for dp, _d, fs in os.walk(dest) for f in fs)
-
-    print("  zorunlu dosyalarin hepsi yerinde")
-    print("  models/ : %d ONNX, manifest ile ayni" % n_onnx)
-    print("  SHA-256 : %d model dogrulandi" % len(manifest.get("models") or []))
-    print("  toplam boyut: %.1f MB" % (total / 1e6))
+    print("  [OK] toplam boyut: %.1f MB" % (total / 1e6))
 
     # ---- klasor yapisi ----------------------------------------------------
     print()
@@ -381,7 +471,7 @@ def main(argv=None):
     print("  calisiyor.")
 
     print()
-    print("all checks passed")
+    print("PAKET TESLIME HAZIR")
     print()
     print("Simdi su komutlar calisir:")
     print("  cd %s" % args.dest)

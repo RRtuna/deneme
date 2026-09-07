@@ -211,6 +211,9 @@ def main(argv=None):
     ap.add_argument("--team-id", default="")
     ap.add_argument("--application-id", default="")
     ap.add_argument("--out", default="", help="cikti json (bos = otomatik ad)")
+    ap.add_argument("--max-fail", type=int, default=-1,
+                    help="on islemede kac kayit duserse teslim REDDEDILSIN "
+                         "(-1 = otomatik: kayitlarin %%1'i, en az 5)")
     ap.add_argument("--validate", default="",
                     help="uretme, VAR OLAN bir json'u denetle")
     args = ap.parse_args(argv)
@@ -252,7 +255,34 @@ def main(argv=None):
     if not args.root:
         raise SystemExit("--root zorunlu")
 
+    import inspect                                # noqa: PLC0415
     import predict as pr                          # paketin kendi cikarim kodu
+    import ecg_preprocess as ep                   # noqa: PLC0415
+
+    def bundle_attr(b, name, manifest_keys, fallback):
+        """Bundle'in ic alanlarina BAGIMLI OLMA.
+
+        Paketin `predict.py`'si farkli bir surumden olabilir (ornegin
+        `n_features` / `extra_features` alanlari yok, manifest anahtarlari
+        Turkce). Once nesneden, sonra manifestten, en son varsayilandan al.
+        """
+        v = getattr(b, name, None)
+        if v is not None:
+            return v
+        man = getattr(b, "manifest", {}) or {}
+        for k in manifest_keys:
+            if man.get(k) not in (None, ""):
+                return man[k]
+        return fallback
+
+    def call_load_one(path, target_fs, extra):
+        """load_one imzasi surumden surume degisti -- kac argument aliyorsa o."""
+        try:
+            n = len(inspect.signature(pr.load_one).parameters)
+        except (TypeError, ValueError):
+            n = 2
+        return pr.load_one(path, target_fs) if n < 3 \
+            else pr.load_one(path, target_fs, extra)
 
     ids_paths = find_records(args.root)
     if args.ids:
@@ -269,17 +299,46 @@ def main(argv=None):
 
     print("test kaydi     : %d" % len(order))
     bundle = pr.Bundle(args.models, args.threads or None)
-    target_fs = bundle.manifest.get("target_fs")
-    print("model          : %d ONNX grafigi" % len(bundle))
-    print("ozellik sayisi : %d" % bundle.n_features)
+    man = getattr(bundle, "manifest", {}) or {}
+    target_fs = man.get("target_fs") or getattr(ep, "TARGET_FS", None)
+    n_feat = int(bundle_attr(bundle, "n_features", ("n_features", "ozellik_sayisi"),
+                             len(getattr(ep, "FEATURE_NAMES", range(37)))))
+    input_len = int(bundle_attr(bundle, "input_len", ("input_len", "giris_uzunlugu"),
+                                getattr(ep, "TARGET_LEN", 1500)))
+    n_lead = int(getattr(ep, "N_LEADS", 12))
+    extra = bool(getattr(bundle, "extra_features", False))
 
-    signals = np.zeros((len(order), 12, bundle.input_len), dtype=np.float32)
-    feats = np.zeros((len(order), bundle.n_features), dtype=np.float32)
+    print("model          : %d ONNX grafigi" % len(bundle))
+    print("ozellik sayisi : %d%s" % (n_feat, "  (+artik olcumleri)" if extra else ""))
+
+    # ---- ON KONTROL: tek kayit isle, gercek sekilleri OGREN ----------------
+    # Manifest ile paketin `predict.py`'si farkli surumlerden olabilir. Ozellik
+    # uzunlugunu manifestten VARSAYMAK, her kaydin sessizce dusmesine ve
+    # yapisal olarak gecerli ama ICI COP bir teslim dosyasina yol acar.
+    try:
+        x0, f0 = call_load_one(ids_paths[order[0]], target_fs, extra)
+    except Exception as exc:                     # noqa: BLE001
+        raise SystemExit("ILK KAYIT ISLENEMEDI (%s): %s\n"
+                         "  Paket ile test verisi uyusmuyor olabilir."
+                         % (order[0], exc))
+    x0 = np.asarray(x0)
+    f0 = np.asarray(f0).ravel()
+    if x0.shape[0] != n_lead or x0.shape[1] != input_len:
+        print("  NOT: sinyal sekli %s, manifest (%d, %d) diyordu -- sinyale uyuldu"
+              % (x0.shape, n_lead, input_len))
+        n_lead, input_len = int(x0.shape[0]), int(x0.shape[1])
+    if f0.size != n_feat:
+        print("  NOT: ozellik uzunlugu %d, manifest %d diyordu -- sinyale uyuldu"
+              % (f0.size, n_feat))
+        n_feat = int(f0.size)
+
+    signals = np.zeros((len(order), n_lead, input_len), dtype=np.float32)
+    feats = np.zeros((len(order), n_feat), dtype=np.float32)
     failed = []
     t0 = time.time()
     for i, rid in enumerate(order):
         try:
-            x, f = pr.load_one(ids_paths[rid], target_fs, bundle.extra_features)
+            x, f = call_load_one(ids_paths[rid], target_fs, extra)
             signals[i], feats[i] = x, f
         except Exception as exc:                 # noqa: BLE001
             failed.append((rid, "%s: %s" % (type(exc).__name__, exc)))
@@ -291,18 +350,29 @@ def main(argv=None):
     elapsed = time.time() - t0
     print("toplam %.1f sn  (%.0f ms/kayit)" % (elapsed, 1000 * elapsed / len(order)))
 
+    limit = args.max_fail if args.max_fail >= 0 else max(5, len(order) // 100)
     if failed:
         print()
-        print("UYARI: %d kayit on islenemedi -- esit olasilik yazilacak" % len(failed))
+        print("UYARI: %d kayit on islenemedi (esik %d)" % (len(failed), limit))
         for rid, e in failed[:5]:
             print("   %s  %s" % (rid, e))
+        if len(failed) > limit:
+            raise SystemExit(
+                "\nTESLIM REDDEDILDI: %d/%d kayit on islenemedi.\n"
+                "  Bu kayitlara esit olasilik yazmak, yapisal olarak gecerli ama\n"
+                "  ICI COP bir dosya uretir. Once sebebi bul.\n"
+                "  Bilerek devam etmek icin: --max-fail %d"
+                % (len(failed), len(order), len(failed)))
+        print("  esigin altinda -- bu kayitlara esit olasilik yaziliyor")
         # Bu kayitlar icin duzgun bir sey yapmak sart: id EKSIK BIRAKILAMAZ.
         fail_idx = {order.index(r) for r, _e in failed}
         for i in fail_idx:
             prob[i] = 1.0 / len(CLASS_ORDER)
 
     # ---- JSON kur ---------------------------------------------------------
-    pkg_classes = [c.upper() for c in bundle.classes]
+    pkg_classes = [str(c).upper() for c in
+                   bundle_attr(bundle, "classes", ("classes", "siniflar"),
+                               list(getattr(ep, "CLASSES", CLASS_ORDER)))]
     if sorted(pkg_classes) != sorted(CLASS_ORDER):
         raise SystemExit("paket siniflari %s, kilavuz %s bekliyor"
                          % (pkg_classes, list(CLASS_ORDER)))
@@ -369,6 +439,13 @@ def main(argv=None):
     cnt = Counter(p["predicted_class"] for p in predictions)
     for c in CLASS_ORDER:
         print("  %-7s %6d" % (c, cnt[c]))
+    top_share = max(cnt.values()) / len(predictions)
+    if top_share > 0.90:
+        print()
+        print("  !! DIKKAT: tahminlerin %%%.0f'i TEK sinifta." % (100 * top_share))
+        print("  !! Bu genellikle modelin degil, BORU HATTININ bozuk oldugunu")
+        print("  !! gosterir (ozellik uzunlugu, on isleme, yanlis paket).")
+        print("  !! Teslim etmeden once sebebini bul.")
     print()
     print("all checks passed")
     return 0
