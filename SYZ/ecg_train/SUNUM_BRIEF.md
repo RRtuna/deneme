@@ -9,7 +9,11 @@
 > **Kimin projesi:** Takım `tkt-26`, Özel İzmir Bahçeşehir 50. Yıl Fen ve
 > Teknoloji Lisesi. Lise seviyesi, Sağlıkta Yapay Zekâ Yarışması.
 >
-> **Tarih:** Bu belge 7 Eylül 2026'da yazıldı. Yarışma ~11-12 Eylül.
+> **Final:** **16–18 Eylül 2026, Dicle Üniversitesi Konferans Salonu** (Diyarbakır).
+> 16 Eylül 09:30'da alanda hazır bulunmak zorunlu. Bu belge 7 Eylül'de yazıldı.
+>
+> **Kaynak belgeler:** yarışma şartnamesi + **Final Uygulama, Model Testi ve
+> Sonuç Teslim Kılavuzu**. İkincisi puanlama ve teslim konusunda belirleyici.
 
 ---
 
@@ -50,20 +54,43 @@ bunun üzerinde yapıldı.
 
 Bunlar sunumun çerçevesini belirliyor, mutlaka okunmalı.
 
-### §7.4 ve §7.5 — puanlama
+### Puanlama — ve sunumun ÖNKOŞULU
 
-> "Final Yarışmaları (Fiziki) **%90**, Final Sunum Puanlaması **%10**."
-> "Proje Sunuş Formu 0, Proje Detay Raporu 0."
+Şartname §7.4: "Final Yarışmaları (Fiziki) **%90**, Final Sunum Puanlaması
+**%10**." Proje Sunuş Formu ve Proje Detay Raporu **0 puan** (yalnızca eleme).
 
-**Sonuç:** Sunum tek başına 10 puan. Modeli 0.8412'den 0.85'e çıkarmak 90
-puanın içinde ~1 puanlık bir hareket. **Sunumun kaldıracı 10 kat daha büyük.**
+Ama Final Kılavuzu madde 5 bunu niteliyor:
 
-> "Yarışma jürisi, finale kalan takımların **kodlarını tekrar çalıştırmasını**
-> ve beyan ettikleri sonuçları bulmalarını isteme yetkisine sahiptir."
+> "Her seviyede **model testi sonucunda ilk 10'a giren takımlar** sunum yapmaya
+> hak kazanır."
 
-**Sonuç:** Bu bir puan değil, bir eşik. Yerinde koşturulamayan bir sistem
-diğer her şeyi geçersiz kılar. Sunumda "tek komutla, PyTorch olmadan,
-internetsiz çalışır" diyebilmek kritik.
+**Sonuç:** Sunum, model performansının **arkasında kilitli**. İlk 10'a
+giremezsen sunum diye bir şey yok. Yani model performansı iki işlevli:
+%90 ağırlık **ve** sunumun kapısı.
+
+### Sunumun biçimsel kuralları (Kılavuz md. 5)
+
+| kural | değer |
+|---|---|
+| süre | **10 dakika** sunum + **3 dakika** soru-cevap |
+| puan | 100 üzerinden; her jüri üyesinin puanı ortalamaya girer |
+| şablon | **organizasyonun paylaşacağı güncel şablona uygun** olmalı |
+| sunan | **yalnızca takım üyeleri** |
+| gün | 18 Eylül öğleden sonra (lise seviyesi) |
+
+10 dakika kısa. Aşağıdaki çatı buna göre kırpılmalı.
+
+### Yeniden üretilebilirlik — bir puan değil, bir eşik
+
+Şartname: "Yarışma jürisi, finale kalan takımların **kodlarını tekrar
+çalıştırmasını** ve beyan ettikleri sonuçları bulmalarını isteme yetkisine
+sahiptir."
+
+Kılavuz md. 6 bunu somutlaştırıyor: USB ile teslim edilecek model paketi
+ağırlıkları, çıkarım kodunu, `requirements.txt`'yi ve çalıştırma komutunu
+içeren bir README'yi taşımalı.
+
+Sunumda "tek komutla, PyTorch olmadan, internetsiz çalışır" diyebilmek kritik.
 
 ### §7.2 — final değerlendirmesi yeni bir veri setinde
 
@@ -405,51 +432,75 @@ ensemble.py  →  export.py (int8)  →  paketten ham WFDB ile çıkarım
 - Paket boyutu: **3.8× küçültme** (int8 sayesinde)
 - Paket, hiçbir internet bağlantısı olmadan, PyTorch kurulu olmadan çalışıyor
 
+### JSON teslim üreteci ve doğrulayıcı (`package_src/make_submission.py`)
+
+Kılavuz md. 3 çıktının **JSON** olmasını ve çok katı kurallara uymasını
+istiyor: sınıf adları BÜYÜK HARF, olasılık toplamı 1 ±0.001, id eksik/fazla/
+tekrar yok, NaN/Infinity yok, `competition_level: "LISE"`. Tek hatalı alan
+dosyayı geçersiz kılıyor ve **süre durmuyor** (md. 7).
+
+Bunun için ayrı bir üretici + doğrulayıcı yazıldı:
+- yazdıktan sonra dosyayı **diskten geri okuyup tekrar doğruluyor**
+- yuvarlama kaymasını en yüksek sınıfa yediriyor, toplam 1'de kalıyor
+- ön işlemede hata veren kayda eşit olasılık yazıyor — **id asla eksik kalmıyor**
+- olasılıkları ezmiyor (md. 4: eşitlik bozucu metrik **PR-AUC**)
+
+**Bilerek bozulmuş sekiz dosyayla test edildi, sekizi de yakalandı:** olasılık
+toplamı, tekrar eden id, eksik id, küçük harf sınıf adı, NaN, eksik sınıf,
+yanlış `competition_level`, `predicted_class` ile en yüksek olasılığın
+tutmaması.
+
+Sunumda bu iyi bir slayt: *"teslim formatını da bir kapıdan geçirdik."*
+
 ---
 
 ## 11. KALAN GÜNLERİN PLANI (bilgi amaçlı)
 
-Detayı `PLAN_5GUN.md`'de. Özet:
+Detayı **`PLAN_FINAL.md`**'de (`PLAN_5GUN.md` geçersiz — takvim ve öncelik
+sırası yanlıştı). Özet:
 
-| gün | iş |
+| tarih | iş |
 |---|---|
-| 0 | İndirmeleri başlat, `source_breakdown.py` koş, paketi yedekle |
-| 1 | Dış veri ekle, **fold-0 kapısı** → kazanç yoksa DUR |
-| 2 | Tam 5-fold (kapı geçtiyse), **sunumu bitir** |
-| 3 | McNemar, ensemble, export, paket doğrulama |
-| 4 | Dondur, jüri provası, sunum provası |
-| 5 | Tampon |
+| 7–9 Eylül | **Teslim mekaniğini kilitle**: JSON üreteci, `team_id`/`application_id`, `requirements.txt`, README, **offline kuru prova** |
+| 9–12 Eylül | Dış veri: indir, `source_breakdown.py`, `add_external.py`, **fold-0 kapısı** |
+| 13–14 Eylül | Sunum (şablon geldiğinde), 3 kez süre tutarak prova |
+| 15 Eylül | Dondur, iki USB, bulut yedeği, son offline prova |
+| **16 Eylül** | **09:30'da alanda ol.** Model testi, JSON üret → doğrula → **hemen yükle** |
+| 17 Eylül | İlk 10 duyurulur |
+| 18 Eylül | Sunum (ilk 10'a girildiyse) |
 
-**Kural sıfır:** çalışan 0.8412 paketi hiçbir adımda üzerine yazılmaz. Her
-deney ayrı `--tag` ve ayrı cache kullanır.
+**Kural sıfır:** çalışan 0.8412 paketi hiçbir adımda üzerine yazılmaz.
 
-**Dış veri planı:** PhysioNet/CinC Challenge 2021 havuzundan dengeli ~900/sınıf
-(~4.700 kayıt). Eklenen kayıtlar `split="extra"` alır ve **yalnızca eğitim
-fold'larına** girer, hiçbir fold'un doğrulamasına girmez — böylece OOF hâlâ
-yalnızca yarışma verisinde ölçülür ve önceki tüm deneylerle karşılaştırılabilir
-kalır.
+**Öncelik notu:** teslim mekaniği model iyileştirmesinden **önce** gelir.
+Bozuk bir JSON, en iyi modeli bile sıfırlar ve kılavuz md. 7'ye göre teknik
+sorunlar süreyi durdurmaz.
+
+**Sigorta:** birden fazla yükleme serbest, **son geçerli dosya** sayılıyor
+(md. 2/5). Erken bir geçerli dosya yükle, sonra vakit kalırsa iyileştir.
 
 ---
 
-## 12. SUNUM İÇİN ÖNERİLEN ÇATI
+## 12. SUNUM İÇİN ÖNERİLEN ÇATI — 10 DAKİKA
 
-Bu bir öneri, kalıp değil. Süreyi bilmiyorum, ona göre kırpılmalı.
+Kılavuz: 10 dakika sunum + 3 dakika soru-cevap. **Organizasyonun paylaşacağı
+şablona uygun olmak zorunlu** — şablon geldiğinde bu çatı ona oturtulmalı.
 
-1. **Problem** — 5 sınıflı EKG, macro-F1, CPU-only, ONNX teslim
-2. **Sistem** — boru hattı şeması, sıfırdan yazılan WFDB okuyucu ve sinyal
-   işleme, tek kaynaklı ön işleme kuralı
-3. **Sonuç** — 0.8412, %95 GA [0.8140, 0.8644], sınıf bazında tablo
-4. **Darboğazın anatomisi** — tüm hata AFIB/AFL'de; dört bağımsız yöntem aynı
-   duvara çarptı; hataların %93.4'ü modelin kararsız olduğu yerde; bunun
-   anlamı etiket değil, girdi belirsizliği
-5. **Metodoloji** — OOF-only seçim, Bayes tavanlı kıyas kümesi, eşleştirilmiş
-   McNemar, çeşitlilik kapısı, sızıntı taraması
-6. **Elenen fikirler tablosu** — 12 fikir, her biri bir sayıyla elenmiş
-7. **Genelleme** — veri kökeni analizi, kaynak dengesi bulgusu, §7.2 dış
-   doğrulaması için dürüst beklenti *(source_breakdown sonucu geldiğinde)*
-8. **Canlı demo** — `ecg_demo.py`: bir kayıt seç, tahmini gör; toplu skor koş
-9. **Tekrarlanabilirlik** — tek komut, PyTorch yok, internet yok, SHA-256
-   sağlamalı manifest, kendi kendini doğrulayan ihracat
+10 dakika ≈ 8-10 slayt. Önerilen dağılım:
+
+| dk | konu | içerik |
+|---|---|---|
+| 0–1 | Problem | 5 sınıf, macro-F1, CPU-only, ONNX teslim |
+| 1–2 | Sistem | boru hattı şeması; WFDB okuyucu ve sinyal işleme sıfırdan yazıldı; **tek kaynaklı ön işleme** kuralı |
+| 2–3 | Sonuç | 0.8412, %95 GA [0.8140, 0.8644], sınıf bazında tablo |
+| 3–5 | **Darboğazın anatomisi** | tüm hata AFIB/AFL'de; dört bağımsız yöntem aynı duvara çarptı; hataların %93.4'ü modelin kararsız olduğu yerde → etiket değil, girdi belirsizliği |
+| 5–7 | **Metodoloji** | OOF-only seçim, Bayes tavanlı kıyas kümesi, eşleştirilmiş McNemar, çeşitlilik kapısı, sızıntı taraması |
+| 7–8 | **Elenen fikirler** | 12 fikir, her biri bir sayıyla elenmiş (tablo) |
+| 8–9 | Genelleme | veri kökeni analizi, kaynak dengesi, dış doğrulama için dürüst beklenti |
+| 9–10 | Tekrarlanabilirlik + demo | tek komut, PyTorch yok, internet yok, SHA-256 manifest, kendi kendini doğrulayan ihracat |
+
+**Canlı demo riski:** 10 dakika içinde demo çökerse telafi edemezsin. Ya
+`ecg_demo.py`'nin **kaydedilmiş ekran görüntülerini/videosunu** kullan, ya da
+demoyu soru-cevap bölümüne sakla.
 
 ### Vurgulanacak üç cümle
 
@@ -460,13 +511,22 @@ Bu bir öneri, kalıp değil. Süreyi bilmiyorum, ona göre kırpılmalı.
 - *"Sistemi PyTorch'suz, internetsiz, tek komutla çalışacak şekilde paketledik
   ve paketin skorunu eğitimdeki skorla birebir doğruladık."*
 
+### Soru-cevap hazırlığı (3 dakika)
+
+| muhtemel soru | cevap |
+|---|---|
+| "Neden AFIB/AFL'de düşük?" | darboğaz anatomisi; dört bağımsız yöntemin aynı duvara çarpması; hataların %93.4'ünün kararsız bölgede olması |
+| "Modeli neden büyütmediniz?" | Kaggle'ın 8.8 M parametreli GPU modeli 0.701 aldı, bizim 0.760 |
+| "Neden 150 Hz?" | 250 Hz denendi, kazanç yok; sürenin %70'i zaten ön işleme |
+| "Genelleme nasıl?" | veri kökeni analizi + `source_breakdown.py` sayısı |
+| "Dış veri kullandınız mı?" | şartname §3.1.1 izin veriyor; sızıntı taramalı bir araç yazıldı |
+
 ### Söylenmemesi gerekenler
 
 - ❌ "Kaggle'ı geçtik" — geçilmedi, güven aralığı örtüşüyor
 - ❌ "%84 doğrulukla hastalık teşhis ediyoruz" — bu bir tarama/karar destek
   aracı, teşhis aracı değil; klinik iddia kurma
-- ❌ Dış doğrulamada 0.84 bekleneceğini ima etme — beklenti daha düşük olabilir,
-  `source_breakdown.py` sonucu bunu söyleyecek
+- ❌ Dış doğrulamada 0.84 bekleneceğini ima etme — beklenti daha düşük olabilir
 - ❌ Doğrulanmamış sayı kullanma — bu belgede ⚠️ işaretli olanlar henüz ölçülmedi
 
 ---
@@ -491,7 +551,8 @@ sunum için altın değerinde) · `SONUC.md` · `PLAN_5GUN.md` · `VERI_KAYNAKLA
 
 **Çekirdek kod:**
 `wfdb_lite.py` · `ecg_preprocess.py` · `prep.py` · `model.py` · `train.py` ·
-`ensemble.py` · `export.py` · `package_src/predict.py` · `package_src/ecg_demo.py`
+`ensemble.py` · `export.py` · `package_src/predict.py` ·
+`package_src/make_submission.py` · `package_src/ecg_demo.py`
 
 **Ölçüm ve kapı araçları:**
 `check_diversity.py` · `afib_afl_diag.py` · `resid_probe.py` ·
