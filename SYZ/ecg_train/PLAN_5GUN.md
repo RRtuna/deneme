@@ -1,3 +1,19 @@
+> # ⚠️ BU PLAN GEÇERSİZ
+>
+> Final Uygulama ve Sonuç Teslim Kılavuzu okundu; planın dayandığı iki varsayım
+> da yanlış çıktı:
+>
+> 1. **Takvim:** final 16–18 Eylül (Dicle Üniversitesi), 5 gün değil 9 gün.
+> 2. **Öncelik:** sunum yalnızca **model testinde ilk 10'a girenlere** açık.
+>    Yani sunum, model performansının arkasında kilitli — bu belgedeki
+>    "sunumun kaldıracı 10 kat" ifadesi YANLIŞTIR.
+>
+> Geçerli plan: **`PLAN_FINAL.md`**
+>
+> (Aşağıdaki içerik yalnızca kayıt amacıyla duruyor.)
+
+---
+
 # 5 günlük plan — zaman/kazanç sırasına göre
 
 ## Kural sıfır: çalışan paketi asla bozma
