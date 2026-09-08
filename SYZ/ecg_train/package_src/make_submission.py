@@ -157,6 +157,99 @@ def force_ort_threads(intra, inter=1):
     return True
 
 
+def prebuild_sessions(pr, models_dir, intra, inter=1):
+    """20 ONNX oturumunu ACIKCA kurup `pr._SESSIONS` icine yerlestir.
+
+    `predict.py` DEGISMEZ. Yapilan tek sey, o dosyanin tembel kurdugu
+    oturumlarin yerine ayni modellerden acik `SessionOptions` ile kurulmus
+    oturumlar koymak; ardindan `pr.predict_record()` hic degismeden kullanilir.
+
+    Modeller `pr.MANIFEST` icindeki uye listesinden okunur (modeller / models /
+    uyeler / members) ve her uyenin yol alani dosya / file / path / yol
+    anahtarlarindan cozulur. Liste `(manifest_kaydi, oturum)` ciftleri olarak
+    kurulur.
+
+    DIKKAT: `_SESSIONS`'in ic yapisi paketten pakete degisebilir. Bu yuzden
+    donen deger cagiran tarafta DOGRULANMALI; uymazsa `restore()` ile eski
+    haline donulmelidir. Sessizce yanlis bir yapi yerlestirmek, tum kayitlarin
+    dusmesine ya da -- daha kotusu -- anlamsiz cikti uretilmesine yol acar.
+
+    Dondurur: (kurulan_sayi, restore_fonksiyonu, aciklama)
+              basarisizlikta (0, None, sebep)
+    """
+    if not hasattr(pr, "_SESSIONS"):
+        return 0, None, "pakette _SESSIONS yok"
+    manifest = getattr(pr, "MANIFEST", None) or {}
+    members = None
+    for k in ("modeller", "models", "uyeler", "members"):
+        v = manifest.get(k)
+        if isinstance(v, (list, tuple)) and v:
+            members = list(v)
+            break
+    if not members:
+        return 0, None, "manifestte model listesi bulunamadi"
+
+    try:
+        import onnxruntime as ort                # noqa: PLC0415
+    except Exception as exc:                     # noqa: BLE001
+        return 0, None, "onnxruntime yok: %s" % exc
+
+    # Yamali InferenceSession varsa ORIJINALINI kullan; asagida zaten acik
+    # SessionOptions veriyoruz, iki kez ayarlamaya gerek yok.
+    mk = getattr(ort.InferenceSession, "_ms_orig", ort.InferenceSession)
+
+    def resolve(entry):
+        if isinstance(entry, str):
+            rel = entry
+        else:
+            rel = None
+            for k in ("dosya", "file", "path", "yol"):
+                v = entry.get(k) if hasattr(entry, "get") else None
+                if v:
+                    rel = str(v)
+                    break
+        if not rel:
+            return None
+        if os.path.isabs(rel) and os.path.exists(rel):
+            return rel
+        for base in (models_dir, HERE, os.getcwd(),
+                     os.path.dirname(getattr(pr, "__file__", "") or "")):
+            if not base:
+                continue
+            cand = os.path.join(base, rel)
+            if os.path.exists(cand):
+                return cand
+        return None
+
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = int(intra)
+    so.inter_op_num_threads = int(inter)
+    try:
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    except Exception:                            # noqa: BLE001
+        pass
+
+    built = []
+    for entry in members:
+        path = resolve(entry)
+        if path is None:
+            return 0, None, "model dosyasi bulunamadi: %r" % (entry,)
+        try:
+            sess = mk(path, so, providers=["CPUExecutionProvider"])
+        except Exception as exc:                 # noqa: BLE001
+            return 0, None, "%s acilamadi: %s" % (os.path.basename(path), exc)
+        built.append((entry, sess))
+
+    old = pr._SESSIONS
+
+    def restore():
+        pr._SESSIONS = old
+
+    pr._SESSIONS = built
+    return len(built), restore, "%d oturum intra=%d inter=%d ile kuruldu" % (
+        len(built), intra, inter)
+
+
 def filter_backend():
     """ecg_preprocess hangi filtre arka ucunu kullaniyor: scipy mi, saf numpy mi."""
     try:
@@ -679,13 +772,29 @@ def main(argv=None):
         print("model          : %d ONNX grafigi" % n_models)
         print("siniflar       : %s" % ", ".join(pkg_classes))
 
+        # ---- ONNX thread ayari ----------------------------------------
+        # --threads 0 (varsayilan): hicbir sey yapilmaz, ESKI DAVRANIS.
+        # --threads N > 0: 20 oturum, cikarim BASLAMADAN once acik
+        # SessionOptions ile yeniden kurulup pr._SESSIONS'a yerlestirilir.
+        # predict.py degismez; sonra onun predict_record'u aynen kullanilir.
+        sess_restore = None
         if args.threads:
-            print("ORT thread      : intra=%d inter=1%s"
-                  % (args.threads, "" if ort_patched
-                     else "   (UYGULANAMADI -- onnxruntime yok?)"))
+            print("ONNX thread    : %d (intra-op), 1 (inter-op)" % args.threads)
+            n_built, sess_restore, note = prebuild_sessions(
+                pr, args.models, args.threads, 1)
+            if n_built:
+                print("                 %s" % note)
+            else:
+                # Onceden kurulamadi. force_ort_threads import ONCESINDE
+                # uygulandigi icin oturumlar yine dogru thread sayisiyla
+                # kurulur -- kayip yok, sadece tembel kurulur.
+                print("                 onceden kurulamadi (%s)" % note)
+                print("                 ORT yamasiyla uygulandi%s"
+                      % ("" if ort_patched else "  -- UYGULANAMADI!"))
         else:
-            print("ORT thread      : ORT varsayilani (tum cekirdekler).")
-            print("                  Kucuk 1B modellerde bu YAVAS olabilir;\n                  --threads 2 deneyin.")
+            print("ONNX thread    : ORT varsayilani (tum cekirdekler)")
+            print("                 Kucuk 1B modellerde YAVAS olabilir; "
+                  "--threads 2 deneyin.")
         fb = filter_backend()
         if fb:
             print("filtre arka ucu: %s%s" % (fb, "   <-- scipy kurulu degil, "
@@ -720,19 +829,32 @@ def main(argv=None):
 
         t0 = time.time()
         first_path = ids_paths[order[0]]
-        probe_err = []
-        path_form = None
-        for form, cand in (("hea", first_path), ("stem", as_stem(first_path))):
-            if cand == first_path and form == "stem":
-                continue
-            try:
-                pred_idx, pred_prob = pr.predict_record(cand)
-                pred_prob = sanitize_prob(pred_prob)
-                path_form = form
-                break
-            except Exception as exc:                 # noqa: BLE001
-                probe_err.append("%s yolu (%s): %s: %s"
-                                 % (form, cand, type(exc).__name__, exc))
+
+        def probe():
+            """Ilk kaydi iki yol bicimiyle de dene: (bicim, idx, prob, hatalar)."""
+            errs = []
+            for form, cand in (("hea", first_path), ("stem", as_stem(first_path))):
+                if cand == first_path and form == "stem":
+                    continue
+                try:
+                    idx, p = pr.predict_record(cand)
+                    return form, idx, sanitize_prob(p), errs
+                except Exception as exc:             # noqa: BLE001
+                    errs.append("%s yolu (%s): %s: %s"
+                                % (form, cand, type(exc).__name__, exc))
+            return None, None, None, errs
+
+        path_form, pred_idx, pred_prob, probe_err = probe()
+
+        # Onceden kurdugumuz _SESSIONS'in yapisi pakete UYMAMIS olabilir.
+        # Oyleyse eski haline don ve tekrar dene: force_ort_threads zaten
+        # import oncesi uygulandigi icin thread ayari yine gecerli olur.
+        if path_form is None and sess_restore is not None:
+            print("  NOT: onceden kurulan _SESSIONS bu pakete uymadi, geri alindi")
+            sess_restore()
+            sess_restore = None
+            path_form, pred_idx, pred_prob, probe_err = probe()
+
         if path_form is None:
             raise SystemExit(
                 "ILK KAYIT ISLENEMEDI (%s):\n  %s\n"
