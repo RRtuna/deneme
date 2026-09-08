@@ -349,7 +349,7 @@ def main(argv=None):
         n_lead = int(getattr(ep, "N_LEADS", 12))
         extra = bool(getattr(bundle, "extra_features", False))
 
-        print("API            : Bundle (eski paket)")
+        print("API            : Bundle (klasik paket)")
         print("model          : %d ONNX grafigi" % len(bundle))
         print("ozellik sayisi : %d%s" % (n_feat, "  (+artik olcumleri)" if extra else ""))
 
@@ -392,53 +392,104 @@ def main(argv=None):
                                    list(getattr(ep, "CLASSES", CLASS_ORDER)))]
 
     else:
-        # ---- PREDICT_RECORD TABANI API (yeni/gercek) ------------------------
-        manifest = pr.MANIFEST or {}
+        # ---- PREDICT_RECORD TABANI API (final paket) ------------------------
+        # Bu yolda ON ISLEME YAPILMAZ. `predict_record()` zaten WFDB okuma ->
+        # E.prepare() -> ozellik olcekleme -> 20 ONNX ensemble zincirinin
+        # tamamini kendisi kosuyor. Burada tekrar yapmak hem yavaslatir hem de
+        # paketin dogrulanmis davranisindan sapma riski yaratir.
+        manifest = getattr(pr, "MANIFEST", None) or {}
         pkg_classes = [str(c).upper() for c in pr.CLASSES]
 
-        # Model sayisini manifest'ten al (farkli sema anahtarlarina duyarli)
-        models_key = get_manifest_field(manifest, "modeller", "models", "uyeler", "members", default=[])
-        n_models = len(models_key) if isinstance(models_key, (list, tuple)) else 0
+        # Model sayisini manifestten al (farkli sema anahtarlarina duyarli)
+        members = get_manifest_field(manifest, "modeller", "models",
+                                     "uyeler", "members", default=[])
+        n_models = len(members) if isinstance(members, (list, tuple, dict)) else 0
 
-        print("API            : predict_record (yeni paket)")
+        print("API            : predict_record (final paket)")
         print("model          : %d ONNX grafigi" % n_models)
         print("siniflar       : %s" % ", ".join(pkg_classes))
 
-        # ---- ON KONTROL: ilk kayiti dene (preprocessing + inference) --------
-        try:
-            pred_idx, pred_prob = pr.predict_record(ids_paths[order[0]])
-            pred_prob = sanitize_prob(pred_prob)
-        except Exception as exc:                     # noqa: BLE001
-            raise SystemExit("ILK KAYIT ISLENEMEDI (%s): %s\n"
-                             "  Paket ile test verisi uyusmuyor olabilir."
-                             % (order[0], exc))
+        if n_models == 0:
+            raise SystemExit(
+                "MANIFEST icinde model listesi bulunamadi.\n"
+                "  Bakilan anahtarlar: modeller / models / uyeler / members\n"
+                "  Manifest ust anahtarlari: %s\n"
+                "  Sema anlasilamadigi icin duruyorum -- 0 modelle uretilen bir\n"
+                "  dosya yapisal olarak gecerli ama ICI COP olurdu."
+                % ", ".join(sorted(map(str, manifest)))[:200])
 
-        # Tahmin ve olasiliklari toplayacak array
+        # ---- ON KONTROL: ilk kayit + yol bicimini KESFET --------------------
+        # predict_record() kimi pakette ".hea" yolunu, kimisinde uzantisiz WFDB
+        # taban adini bekler. VARSAYMA -- ilk kayitta ikisini de dene, calisani
+        # kalan 749 kayit icin kullan. Ikisi de calismiyorsa hemen dur.
+        def as_stem(p):
+            return p[:-4] if p.lower().endswith(".hea") else p
+
+        t0 = time.time()
+        first_path = ids_paths[order[0]]
+        probe_err = []
+        path_form = None
+        for form, cand in (("hea", first_path), ("stem", as_stem(first_path))):
+            if cand == first_path and form == "stem":
+                continue
+            try:
+                pred_idx, pred_prob = pr.predict_record(cand)
+                pred_prob = sanitize_prob(pred_prob)
+                path_form = form
+                break
+            except Exception as exc:                 # noqa: BLE001
+                probe_err.append("%s yolu (%s): %s: %s"
+                                 % (form, cand, type(exc).__name__, exc))
+        if path_form is None:
+            raise SystemExit(
+                "ILK KAYIT ISLENEMEDI (%s):\n  %s\n"
+                "  Paket ile test verisi uyusmuyor olabilir. Kalan %d kaydi\n"
+                "  denemeden duruyorum."
+                % (order[0], "\n  ".join(probe_err), len(order) - 1))
+        if path_form == "stem":
+            print("  NOT: predict_record uzantisiz WFDB taban adi bekliyor")
+
+        def record_arg(rid):
+            p = ids_paths[rid]
+            return p if path_form == "hea" else as_stem(p)
+
+        # Tahmin ve olasiliklari toplayacak dizi
         prob = np.zeros((len(order), len(CLASS_ORDER)), dtype=np.float64)
         failed = []
-        t0 = time.time()
+        # Paketin kendi sinif kararinin argmax ile uyusmadigi kayitlar: bu bir
+        # hata degil ama bilinmesi gerekir (agirlikli oylama vs. argmax).
+        argmax_mismatch = 0
 
-        # Ilk kaydinin sonucu zaten var
-        try:
-            prob[0] = sanitize_prob(pred_prob)
-        except ValueError as e:
-            failed.append((order[0], "olasilik hata: %s" % e))
-            prob[0] = 1.0 / len(CLASS_ORDER)
+        def store(i, rid, idx, p):
+            nonlocal argmax_mismatch
+            prob[i] = p
+            try:
+                if idx is not None and 0 <= int(idx) < len(p) \
+                        and int(idx) != int(np.argmax(p)):
+                    argmax_mismatch += 1
+            except (TypeError, ValueError):
+                pass
 
-        # Geri kalan kayitlari isle
+        store(0, order[0], pred_idx, pred_prob)     # ilk kaydi tekrar kosma
+
         for i in range(1, len(order)):
             rid = order[i]
             try:
-                pred_idx, pred_prob = pr.predict_record(ids_paths[rid])
-                prob[i] = sanitize_prob(pred_prob)
+                idx, p = pr.predict_record(record_arg(rid))
+                store(i, rid, idx, sanitize_prob(p))
             except Exception as exc:                 # noqa: BLE001
                 failed.append((rid, "%s: %s" % (type(exc).__name__, exc)))
                 prob[i] = 1.0 / len(CLASS_ORDER)
             if (i + 1) % 100 == 0 or i + 1 == len(order):
-                print("  tahmin %d/%d  %.0f sn" % (i + 1, len(order), time.time() - t0),
-                      flush=True)
+                print("  tahmin %d/%d  %.0f sn"
+                      % (i + 1, len(order), time.time() - t0), flush=True)
 
         elapsed = time.time() - t0
+        if argmax_mismatch:
+            print("  NOT: %d kayitta paketin sinif indeksi ile en yuksek olasilik"
+                  % argmax_mismatch)
+            print("       ayni degil. Kilavuz madde 3 en yuksek olasiligi sart")
+            print("       kostugu icin JSON'a argmax yazildi.")
 
     if sorted(pkg_classes) != sorted(CLASS_ORDER):
         raise SystemExit("paket siniflari %s, kilavuz %s bekliyor"
@@ -453,18 +504,25 @@ def main(argv=None):
     limit = args.max_fail if args.max_fail >= 0 else max(5, len(order) // 100)
     if failed:
         print()
-        print("UYARI: %d kayit on islenemedi (esik %d)" % (len(failed), limit))
+        print("UYARI: %d kayit islenemedi (esik %d)" % (len(failed), limit))
         for rid, e in failed[:5]:
             print("   %s  %s" % (rid, e))
         if len(failed) > limit:
             raise SystemExit(
-                "\nTESLIM REDDEDILDI: %d/%d kayit on islenemedi.\n"
+                "\nTESLIM REDDEDILDI: %d/%d kayit islenemedi.\n"
                 "  Bu kayitlara esit olasilik yazmak, yapisal olarak gecerli ama\n"
                 "  ICI COP bir dosya uretir. Once sebebi bul.\n"
                 "  Bilerek devam etmek icin: --max-fail %d"
                 % (len(failed), len(order), len(failed)))
         print("  esigin altinda -- bu kayitlara esit olasilik yaziliyor")
         # Bu kayitlar icin duzgun bir sey yapmak sart: id EKSIK BIRAKILAMAZ.
+        # Bundle yolunda dusen kaydin `signals[i]` satiri SIFIR kalir ve
+        # predict_proba o sifirlara bakip kendinden emin gorunen ama anlamsiz
+        # bir olasilik uretir. Uzerine esit olasilik yazmak sart.
+        pos = {r: i for i, r in enumerate(order)}
+        for rid, _e in failed:
+            if rid in pos:
+                prob[pos[rid]] = 1.0 / len(CLASS_ORDER)
 
     # ---- JSON kur ---------------------------------------------------------
 
