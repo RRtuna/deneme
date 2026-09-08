@@ -284,6 +284,44 @@ def main(argv=None):
         return pr.load_one(path, target_fs) if n < 3 \
             else pr.load_one(path, target_fs, extra)
 
+    def get_manifest_field(manifest, *keys, default=None):
+        """Manifest icinde farkli sema anahtarlarina duyarli al."""
+        for k in keys:
+            if k in manifest and manifest[k] not in (None, ""):
+                return manifest[k]
+        return default
+
+    def sanitize_prob(prob_array):
+        """5-elementli olasilik vektorunu kontrol et ve normalize et.
+
+        Returns: normalized 5-element array or raises ValueError
+        """
+        prob_array = np.asarray(prob_array, dtype=np.float64).ravel()
+        if len(prob_array) != len(CLASS_ORDER):
+            raise ValueError("olasilik uzunlugu %d (beklenen %d)"
+                           % (len(prob_array), len(CLASS_ORDER)))
+        # Sonlu olcekleri kontrol et
+        if not np.all(np.isfinite(prob_array)):
+            raise ValueError("NaN/Infinity bulundu")
+        # Negatif olmayan ve toplam > 0 kontrolu
+        if np.any(prob_array < 0):
+            raise ValueError("negatif olasilik")
+        s = prob_array.sum()
+        if s <= 0:
+            raise ValueError("olasilik toplami 0")
+        # Normalize et
+        return prob_array / s
+
+    # ---- API Belirleme: Bundle tabani mi, predict_record tabani mi? --------
+    use_old_api = hasattr(pr, "Bundle") and hasattr(pr, "load_one")
+    use_new_api = hasattr(pr, "predict_record") and hasattr(pr, "MANIFEST") and hasattr(pr, "CLASSES")
+
+    if not (use_old_api or use_new_api):
+        raise SystemExit(
+            "predict modulu ne Bundle()+load_one()+predict_proba() ne de\n"
+            "predict_record()+MANIFEST+CLASSES API'si sunmuyor. "
+            "Paket uyusmuyor.")
+
     ids_paths = find_records(args.root)
     if args.ids:
         want = read_id_list(args.ids)
@@ -298,57 +336,119 @@ def main(argv=None):
         raise SystemExit("%s altinda .hea kaydi bulunamadi" % args.root)
 
     print("test kaydi     : %d" % len(order))
-    bundle = pr.Bundle(args.models, args.threads or None)
-    man = getattr(bundle, "manifest", {}) or {}
-    target_fs = man.get("target_fs") or getattr(ep, "TARGET_FS", None)
-    n_feat = int(bundle_attr(bundle, "n_features", ("n_features", "ozellik_sayisi"),
-                             len(getattr(ep, "FEATURE_NAMES", range(37)))))
-    input_len = int(bundle_attr(bundle, "input_len", ("input_len", "giris_uzunlugu"),
-                                getattr(ep, "TARGET_LEN", 1500)))
-    n_lead = int(getattr(ep, "N_LEADS", 12))
-    extra = bool(getattr(bundle, "extra_features", False))
 
-    print("model          : %d ONNX grafigi" % len(bundle))
-    print("ozellik sayisi : %d%s" % (n_feat, "  (+artik olcumleri)" if extra else ""))
+    if use_old_api:
+        # ---- BUNDLE TABANI API (eski/mevcut) --------------------------------
+        bundle = pr.Bundle(args.models, args.threads or None)
+        man = getattr(bundle, "manifest", {}) or {}
+        target_fs = man.get("target_fs") or getattr(ep, "TARGET_FS", None)
+        n_feat = int(bundle_attr(bundle, "n_features", ("n_features", "ozellik_sayisi"),
+                                 len(getattr(ep, "FEATURE_NAMES", range(37)))))
+        input_len = int(bundle_attr(bundle, "input_len", ("input_len", "giris_uzunlugu"),
+                                    getattr(ep, "TARGET_LEN", 1500)))
+        n_lead = int(getattr(ep, "N_LEADS", 12))
+        extra = bool(getattr(bundle, "extra_features", False))
 
-    # ---- ON KONTROL: tek kayit isle, gercek sekilleri OGREN ----------------
-    # Manifest ile paketin `predict.py`'si farkli surumlerden olabilir. Ozellik
-    # uzunlugunu manifestten VARSAYMAK, her kaydin sessizce dusmesine ve
-    # yapisal olarak gecerli ama ICI COP bir teslim dosyasina yol acar.
-    try:
-        x0, f0 = call_load_one(ids_paths[order[0]], target_fs, extra)
-    except Exception as exc:                     # noqa: BLE001
-        raise SystemExit("ILK KAYIT ISLENEMEDI (%s): %s\n"
-                         "  Paket ile test verisi uyusmuyor olabilir."
-                         % (order[0], exc))
-    x0 = np.asarray(x0)
-    f0 = np.asarray(f0).ravel()
-    if x0.shape[0] != n_lead or x0.shape[1] != input_len:
-        print("  NOT: sinyal sekli %s, manifest (%d, %d) diyordu -- sinyale uyuldu"
-              % (x0.shape, n_lead, input_len))
-        n_lead, input_len = int(x0.shape[0]), int(x0.shape[1])
-    if f0.size != n_feat:
-        print("  NOT: ozellik uzunlugu %d, manifest %d diyordu -- sinyale uyuldu"
-              % (f0.size, n_feat))
-        n_feat = int(f0.size)
+        print("API            : Bundle (eski paket)")
+        print("model          : %d ONNX grafigi" % len(bundle))
+        print("ozellik sayisi : %d%s" % (n_feat, "  (+artik olcumleri)" if extra else ""))
 
-    signals = np.zeros((len(order), n_lead, input_len), dtype=np.float32)
-    feats = np.zeros((len(order), n_feat), dtype=np.float32)
-    failed = []
-    t0 = time.time()
-    for i, rid in enumerate(order):
+        # ---- ON KONTROL: tek kayit isle, gercek sekilleri OGREN ----------------
         try:
-            x, f = call_load_one(ids_paths[rid], target_fs, extra)
-            signals[i], feats[i] = x, f
-        except Exception as exc:                 # noqa: BLE001
-            failed.append((rid, "%s: %s" % (type(exc).__name__, exc)))
-        if (i + 1) % 100 == 0 or i + 1 == len(order):
-            print("  on isleme %d/%d  %.0f sn" % (i + 1, len(order), time.time() - t0),
-                  flush=True)
+            x0, f0 = call_load_one(ids_paths[order[0]], target_fs, extra)
+        except Exception as exc:                     # noqa: BLE001
+            raise SystemExit("ILK KAYIT ISLENEMEDI (%s): %s\n"
+                             "  Paket ile test verisi uyusmuyor olabilir."
+                             % (order[0], exc))
+        x0 = np.asarray(x0)
+        f0 = np.asarray(f0).ravel()
+        if x0.shape[0] != n_lead or x0.shape[1] != input_len:
+            print("  NOT: sinyal sekli %s, manifest (%d, %d) diyordu -- sinyale uyuldu"
+                  % (x0.shape, n_lead, input_len))
+            n_lead, input_len = int(x0.shape[0]), int(x0.shape[1])
+        if f0.size != n_feat:
+            print("  NOT: ozellik uzunlugu %d, manifest %d diyordu -- sinyale uyuldu"
+                  % (f0.size, n_feat))
+            n_feat = int(f0.size)
 
-    prob = bundle.predict_proba(signals, feats)
-    elapsed = time.time() - t0
-    print("toplam %.1f sn  (%.0f ms/kayit)" % (elapsed, 1000 * elapsed / len(order)))
+        signals = np.zeros((len(order), n_lead, input_len), dtype=np.float32)
+        feats = np.zeros((len(order), n_feat), dtype=np.float32)
+        failed = []
+        t0 = time.time()
+        for i, rid in enumerate(order):
+            try:
+                x, f = call_load_one(ids_paths[rid], target_fs, extra)
+                signals[i], feats[i] = x, f
+            except Exception as exc:                 # noqa: BLE001
+                failed.append((rid, "%s: %s" % (type(exc).__name__, exc)))
+            if (i + 1) % 100 == 0 or i + 1 == len(order):
+                print("  on isleme %d/%d  %.0f sn" % (i + 1, len(order), time.time() - t0),
+                      flush=True)
+
+        prob = bundle.predict_proba(signals, feats)
+        elapsed = time.time() - t0
+        pkg_classes = [str(c).upper() for c in
+                       bundle_attr(bundle, "classes", ("classes", "siniflar"),
+                                   list(getattr(ep, "CLASSES", CLASS_ORDER)))]
+
+    else:
+        # ---- PREDICT_RECORD TABANI API (yeni/gercek) ------------------------
+        manifest = pr.MANIFEST or {}
+        pkg_classes = [str(c).upper() for c in pr.CLASSES]
+
+        # Model sayisini manifest'ten al (farkli sema anahtarlarina duyarli)
+        models_key = get_manifest_field(manifest, "modeller", "models", "uyeler", "members", default=[])
+        n_models = len(models_key) if isinstance(models_key, (list, tuple)) else 0
+
+        print("API            : predict_record (yeni paket)")
+        print("model          : %d ONNX grafigi" % n_models)
+        print("siniflar       : %s" % ", ".join(pkg_classes))
+
+        # ---- ON KONTROL: ilk kayiti dene (preprocessing + inference) --------
+        try:
+            pred_idx, pred_prob = pr.predict_record(ids_paths[order[0]])
+            pred_prob = sanitize_prob(pred_prob)
+        except Exception as exc:                     # noqa: BLE001
+            raise SystemExit("ILK KAYIT ISLENEMEDI (%s): %s\n"
+                             "  Paket ile test verisi uyusmuyor olabilir."
+                             % (order[0], exc))
+
+        # Tahmin ve olasiliklari toplayacak array
+        prob = np.zeros((len(order), len(CLASS_ORDER)), dtype=np.float64)
+        failed = []
+        t0 = time.time()
+
+        # Ilk kaydinin sonucu zaten var
+        try:
+            prob[0] = sanitize_prob(pred_prob)
+        except ValueError as e:
+            failed.append((order[0], "olasilik hata: %s" % e))
+            prob[0] = 1.0 / len(CLASS_ORDER)
+
+        # Geri kalan kayitlari isle
+        for i in range(1, len(order)):
+            rid = order[i]
+            try:
+                pred_idx, pred_prob = pr.predict_record(ids_paths[rid])
+                prob[i] = sanitize_prob(pred_prob)
+            except Exception as exc:                 # noqa: BLE001
+                failed.append((rid, "%s: %s" % (type(exc).__name__, exc)))
+                prob[i] = 1.0 / len(CLASS_ORDER)
+            if (i + 1) % 100 == 0 or i + 1 == len(order):
+                print("  tahmin %d/%d  %.0f sn" % (i + 1, len(order), time.time() - t0),
+                      flush=True)
+
+        elapsed = time.time() - t0
+
+    if sorted(pkg_classes) != sorted(CLASS_ORDER):
+        raise SystemExit("paket siniflari %s, kilavuz %s bekliyor"
+                         % (pkg_classes, list(CLASS_ORDER)))
+
+    # ---- Zamanlamayı yazdır
+    ms_per_record = 1000 * elapsed / len(order)
+    records_per_min = 60 * len(order) / elapsed if elapsed > 0 else 0
+    print("toplam %.1f sn  (%.0f ms/kayit, %.0f kayit/dakika)"
+          % (elapsed, ms_per_record, records_per_min))
 
     limit = args.max_fail if args.max_fail >= 0 else max(5, len(order) // 100)
     if failed:
@@ -365,17 +465,8 @@ def main(argv=None):
                 % (len(failed), len(order), len(failed)))
         print("  esigin altinda -- bu kayitlara esit olasilik yaziliyor")
         # Bu kayitlar icin duzgun bir sey yapmak sart: id EKSIK BIRAKILAMAZ.
-        fail_idx = {order.index(r) for r, _e in failed}
-        for i in fail_idx:
-            prob[i] = 1.0 / len(CLASS_ORDER)
 
     # ---- JSON kur ---------------------------------------------------------
-    pkg_classes = [str(c).upper() for c in
-                   bundle_attr(bundle, "classes", ("classes", "siniflar"),
-                               list(getattr(ep, "CLASSES", CLASS_ORDER)))]
-    if sorted(pkg_classes) != sorted(CLASS_ORDER):
-        raise SystemExit("paket siniflari %s, kilavuz %s bekliyor"
-                         % (pkg_classes, list(CLASS_ORDER)))
 
     predictions = []
     for i, rid in enumerate(order):
