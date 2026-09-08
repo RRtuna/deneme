@@ -446,3 +446,75 @@ Yönerge: `DIS_VERI.md`.
 | E1a | `python tools/add_external.py --source <klasör> --cache cache --out cache_ext --dry-run` | etiket haritası doğru mu, kaç sızıntı yakalandı |
 | E1b | aynısı `--dry-run` olmadan, `--per-class N` ile | — |
 | E1c | `python train.py --cache cache_ext --tag ext ...` | OOF > mevcut, `compare_runs.py` p < 0.05 |
+
+---
+
+## T1 — teslim hattı uçtan uca doğrulandı (8 Eylül 2026)
+
+`competition_package` + `make_submission.py` ile 750 `test_public` kaydı
+gerçek 20-model ONNX ensemble'ından geçirildi.
+
+**Sonuç — doğrulanmış release ile birebir aynı:**
+
+| ölçüm | JSON'dan yeniden hesap | release |
+|---|---|---|
+| macro-F1 | 0.8412035805912108 | 0.841204 |
+| accuracy | 0.8453333333333334 | 0.845333 |
+
+Sınıf bazlı F1: NORMAL 0.941558 · AFIB 0.746177 · AFL 0.666667 ·
+LBBB 0.960526 · RBBB 0.891089
+
+Sınıf dağılımı: 158 / 177 / 108 / 154 / 153 — tek sınıfa yığılma yok.
+
+Doğrulanan zincir:
+`20 ONNX → predict_record → make_submission → JSON → yeniden skor → release`
+
+Bu, paketin PyTorch'suz ortamda doğru modeli doğru ön işlemeyle koşturduğunun
+uçtan uca kanıtıdır.
+
+### T1a — hız ölçüldü, tahminim 7.8 kat yanlıştı
+
+| | |
+|---|---|
+| toplam | 5518.1 sn (~92 dk) |
+| kayıt başına | **7357 ms** |
+| verim | **8 kayıt/dakika** |
+
+**Tahminim 942 ms/kayıt idi** (bench: 659.6 ms ön işleme + 20 × 14.11 ms).
+Gerçek bunun 7.8 katı. Sebep: bench sayıları önbelleklenmiş veriden ölçülmüştü,
+ham WFDB okumasını içermiyordu. Bench'ten uçtan uca süre tahmin etmek geçersiz.
+
+Blok bazında ilerleme:
+
+| blok | süre | kayıt başına |
+|---|---|---|
+| 1–100 | 640 sn | 6.4 sn |
+| 101–200 | 1427 sn | **14.3 sn** |
+| 201–750 | ~627 sn/100 | 6.27 sn |
+
+101–200'deki ~13 dk kayıp muhtemelen eşzamanlı Challenge 2021 indirmelerinin
+disk I/O yükü. **Zamanlı ölçümlerde indirmeler durdurulmalı.**
+
+**Risk:** test kümesi 2.000 kayıt ise ~4.2 saat, 5.000 ise ~10.4 saat. Kılavuz
+süreyi belirtmiyor ("yeterli süre verilir") ve madde 7 yazılım kaynaklı
+gecikmelerin süreyi durdurmadığını söylüyor. Hızlandırma artık ayrı bir risk
+kalemi.
+
+Teşhis aracı: `tools/hiz_teshis.py` — kayıt başına maliyeti üçe ayırır
+(model yeniden yükleme / saf çıkarım / okuma+ön işleme) ve en büyük kalemi
+işaret eder. Hangi hızlandırmanın yapılacağı bu ölçüme bağlı.
+
+**Hızlandırma kapısı:** `TEST_PUBLIC_PROVA.json` artık referans çıktıdır.
+Hızlandırılmış her koşu bu dosyayla **birebir aynı** JSON üretmeli; bir bit
+farkı varsa reddedilir.
+
+### T1b — `--retag`
+
+92 dakikalık koşuyu yalnız kimlik alanları için tekrarlamamak üzere eklendi.
+Kaynağı doğrular → alanları değiştirir → tekrar doğrular → yazar → diskten
+geri okur → tekrar doğrular → tahmin sayısının değişmediğini kontrol eder.
+
+Gerçek kimliklerle (`807466` / `4997133`) koşuldu; üretilen
+`TEAM_807466_FINAL.json` bağımsız denetimden geçti: 750 benzersiz id, toplam
+sapması 2.22e-16, sert 0/1 olasılık yok (ortalama en yüksek 0.8227), sınıf
+dağılımı provayla birebir aynı → tahminlere dokunulmadığı doğrulandı.
