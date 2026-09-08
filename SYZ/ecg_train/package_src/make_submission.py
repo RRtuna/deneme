@@ -58,13 +58,26 @@ TOL = 0.001
 # --------------------------------------------------------------------------
 # hizlandirma -- predict.py'ye DOKUNMADAN, calisma aninda
 # --------------------------------------------------------------------------
-# Olculen gercek maliyet (750 kayit, 7357 ms/kayit):
-#   ~4.2 sn  ONNX oturumlarinin HER KAYITTA yeniden kurulmasi
-#   ~1.0 sn  scipy yokken saf-Python ornek-ornek filtre dongusu
-#   ~0.3 sn  20 modelin saf cikarimi
-# Ikisi de paketin kendi dosyalarina dokunmadan giderilebilir. Her ikisi de
-# CIKTIYI DEGISTIRMEZ; --workers ile birlikte kabul kapisi hep aynidir:
-# uretilen JSON referans dosyayla BIREBIR ayni olmali.
+# Gercek pakette olculen kayit basina maliyet (7357 ms/kayit):
+#     0.001 sn  WFDB okuma
+#     0.012 sn  E.prepare (scipy kuruluyken; scipy YOKKEN ~1.0 sn)
+#     0.000 sn  ozellik olcekleme
+#     6.535 sn  20 ONNX cikarim          <-- surenin neredeyse tamami
+#
+# Onemli: oturumlar ZATEN onbellekli (sessions() 1. cagri 3.7 sn, 2. cagri
+# 0.0 sn). "Her kayitta yeniden yukleniyor" hipotezi OLCUMLE CURUTULDU;
+# --cache-sessions bu pakette kazanc getirmez, yalnizca onbelleklemeyen bir
+# pakete karsi sigortadir.
+#
+# Asil sebep ORT thread ASIRI ABONELIGI: varsayilan intra_op=0 (tum
+# cekirdekler) kucuk 1B modellerde zarar veriyor. 20-model olcumu:
+#     1 thread 1.708 sn | 2 thread 1.286 sn | 4 thread 2.119 sn
+#     8 thread 5.448 sn | 16 thread 11.686 sn
+# --threads 2 ile 7357 -> 1906 ms/kayit (3.9x), sinif farki 0, en buyuk
+# olasilik farki 1.34e-6 (batch=1 dogal gurultu seviyesi).
+#
+# Hicbiri grafigi, agirliklari veya hesabi degistirmez. Kabul kapisi hep
+# aynidir: uretilen JSON referans dosyayla BIREBIR ayni olmali.
 
 def memoize_sessions(pr):
     """pr.sessions()'i onbellege al.
@@ -89,6 +102,58 @@ def memoize_sessions(pr):
     cached._ms_cached = True
     cached._ms_orig = fn
     pr.sessions = cached
+    return True
+
+
+def force_ort_threads(intra, inter=1):
+    """onnxruntime oturumlarini belirli thread sayisiyla kurmaya ZORLA.
+
+    NEDEN GEREKLI
+    -------------
+    ORT'nin kendi thread havuzu vardir; OMP_NUM_THREADS / MKL_NUM_THREADS gibi
+    ortam degiskenlerini (OpenMP ile derlenmemis modern yapilarda) DINLEMEZ.
+    Varsayilan `intra_op_num_threads = 0` demek "tum cekirdekleri kullan"
+    demektir. Kucuk 1B modellerde bu asiri abonelik yaratir: is parcaciklarini
+    senkronize etmek, hesabin kendisinden pahaliya gelir.
+
+    Olculen (20-model ensemble, tek kayit):
+        1 thread   1.708 sn
+        2 thread   1.286 sn   <-- en iyi
+        4 thread   2.119 sn
+        8 thread   5.448 sn
+       16 thread  11.686 sn
+
+    Oturumlar `predict.py` icinde kuruldugu ve o dosyaya DOKUNULMADIGI icin
+    ayar, oturumlarin kuruldugu noktada -- `ort.InferenceSession` -- calisma
+    aninda sarmalanarak veriliyor. Bu, ORT'ye kac thread kullanacagini
+    soylemekten baska bir sey yapmaz; grafik, agirliklar ve hesap ayni kalir.
+
+    ONEMLI: `import predict` ONCESINDE cagrilmalidir; predict.py
+    `from onnxruntime import InferenceSession` yapiyorsa sonrasi ise yaramaz.
+
+    Dondurur: sarmalandiysa True.
+    """
+    try:
+        import onnxruntime as ort                # noqa: PLC0415
+    except Exception:                            # noqa: BLE001
+        return False
+    orig = ort.InferenceSession
+    if getattr(orig, "_ms_threads", None) is not None:
+        return False
+
+    def patched(path_or_bytes, sess_options=None, providers=None, **kw):
+        so = sess_options if sess_options is not None else ort.SessionOptions()
+        so.intra_op_num_threads = int(intra)
+        so.inter_op_num_threads = int(inter)
+        try:
+            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        except Exception:                        # noqa: BLE001
+            pass
+        return orig(path_or_bytes, so, providers=providers, **kw)
+
+    patched._ms_threads = (int(intra), int(inter))
+    patched._ms_orig = orig
+    ort.InferenceSession = patched
     return True
 
 
@@ -124,6 +189,10 @@ def _worker_init(pkg_dir, threads, cache_sessions):
     if pkg_dir and pkg_dir not in sys.path:
         sys.path.insert(0, pkg_dir)
     sys.path.insert(0, HERE)
+    # predict import edilmeden ONCE: her isci kendi ORT havuzunu
+    # `threads` ile sinirlar. Bu olmadan N isci x tum cekirdekler
+    # asiri abonelik yapar ve paralellik yavaslatir.
+    force_ort_threads(max(1, int(threads)), 1)
     import predict as pr                        # noqa: PLC0415
     if cache_sessions:
         memoize_sessions(pr)
@@ -448,6 +517,12 @@ def main(argv=None):
         raise SystemExit("--root zorunlu")
 
     import inspect                                # noqa: PLC0415
+    # ORT thread sayisi, oturumlar KURULMADAN once sabitlenmeli --
+    # predict.py `from onnxruntime import InferenceSession` yapiyorsa
+    # importtan sonrasi ise yaramaz.
+    ort_patched = False
+    if args.threads:
+        ort_patched = force_ort_threads(args.threads, 1)
     import predict as pr                          # paketin kendi cikarim kodu
     import ecg_preprocess as ep                   # noqa: PLC0415
 
@@ -604,6 +679,13 @@ def main(argv=None):
         print("model          : %d ONNX grafigi" % n_models)
         print("siniflar       : %s" % ", ".join(pkg_classes))
 
+        if args.threads:
+            print("ORT thread      : intra=%d inter=1%s"
+                  % (args.threads, "" if ort_patched
+                     else "   (UYGULANAMADI -- onnxruntime yok?)"))
+        else:
+            print("ORT thread      : ORT varsayilani (tum cekirdekler).")
+            print("                  Kucuk 1B modellerde bu YAVAS olabilir;\n                  --threads 2 deneyin.")
         fb = filter_backend()
         if fb:
             print("filtre arka ucu: %s%s" % (fb, "   <-- scipy kurulu degil, "
