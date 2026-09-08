@@ -1,3 +1,17 @@
+> # ⚠️ BU PLAN GEÇERSİZ
+>
+> Yerine: **`GUNCEL_PLAN_FINAL_20260908.md`**
+>
+> Bu belge 8 Eylül'de iki noktada eskidi:
+>
+> 1. **8 Eylül 21:00'de organizasyona örnek JSON teslimi** var — bu belgede yok.
+> 2. `make_submission.py` tamamlandı (`887458a`); teslim mekaniği artık
+>    "yazılacak" değil, "koşulacak" durumda.
+>
+> (Aşağıdaki içerik yalnızca kayıt amacıyla duruyor.)
+
+---
+
 # Final planı — 16–18 Eylül, Dicle Üniversitesi
 
 > **`PLAN_5GUN.md` geçersiz.** Final Uygulama ve Sonuç Teslim Kılavuzu okundu ve
