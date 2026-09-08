@@ -216,7 +216,90 @@ def main(argv=None):
                          "(-1 = otomatik: kayitlarin %%1'i, en az 5)")
     ap.add_argument("--validate", default="",
                     help="uretme, VAR OLAN bir json'u denetle")
+    ap.add_argument("--retag", default="",
+                    help="VAR OLAN bir json'un yalniz kimlik alanlarini "
+                         "degistir (tahminlere DOKUNMAZ, modeli tekrar "
+                         "kosturmaz). --team-name/--team-id/--application-id "
+                         "ve --out ile birlikte kullanilir.")
     args = ap.parse_args(argv)
+
+    # ---- kimlik degistirme modu -------------------------------------------
+    # 90+ dakikalik bir kosuyu yalnizca team_id degistirmek icin tekrarlamak
+    # gereksiz: tahminler kimlikten bagimsiz. Ama dosyayi ELLE duzenlemek de
+    # yapilmaz -- duzenlenen dosya dogrulama hattindan gecmemis olur. Bu mod
+    # ayni validate() + diskten geri okuma + tekrar validate zincirinden gecer.
+    if args.retag:
+        for req in ("team_name", "team_id", "application_id"):
+            if not getattr(args, req):
+                raise SystemExit("--retag ile --%s zorunlu"
+                                 % req.replace("_", "-"))
+        try:
+            doc = load_json_strict(args.retag)
+        except Exception as exc:                 # noqa: BLE001
+            print("JSON okunamadi: %s" % exc)
+            return 1
+
+        exp = read_id_list(args.ids) if args.ids else None
+
+        # ONCE kaynak dosya temiz mi -- bozuk bir dosyayi etiketleyip
+        # gecerliymis gibi gondermeyelim.
+        err = validate(doc, exp)
+        if err:
+            print("KAYNAK DOSYA GECERSIZ -- hicbir sey yazilmadi (%d hata):"
+                  % len(err))
+            for e in err[:20]:
+                print("  - %s" % e)
+            return 1
+
+        n_before = len(doc.get("predictions") or [])
+        old = {k: doc.get(k) for k in
+               ("team_name", "team_id", "application_id")}
+        doc["team_name"] = args.team_name
+        doc["team_id"] = args.team_id
+        doc["application_id"] = args.application_id
+        doc["competition_level"] = LEVEL
+
+        err = validate(doc, exp)
+        if err:
+            print("YENI KIMLIKLERLE DOGRULAMA BASARISIZ -- yazilmadi:")
+            for e in err[:20]:
+                print("  - %s" % e)
+            return 1
+
+        tid = args.team_id
+        stem = tid if tid.upper().startswith("TEAM_") else "TEAM_%s" % tid
+        out = args.out or ("%s_FINAL.json" % stem)
+        if os.path.abspath(out) == os.path.abspath(args.retag):
+            raise SystemExit("--out kaynak dosyayla ayni: %s\n"
+                             "  Kaynagin uzerine yazmam -- farkli bir ad ver."
+                             % out)
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, ensure_ascii=False, allow_nan=False,
+                      separators=(",", ":"))
+
+        doc2 = load_json_strict(out)
+        err2 = validate(doc2, exp)
+        if err2:
+            print("YAZILDIKTAN SONRA dogrulama basarisiz:")
+            for e in err2[:20]:
+                print("  - %s" % e)
+            return 1
+        if len(doc2.get("predictions") or []) != n_before:
+            print("tahmin sayisi degisti (%d -> %d) -- bu olmamaliydi"
+                  % (n_before, len(doc2.get("predictions") or [])))
+            return 1
+
+        print("kaynak : %s" % args.retag)
+        print("kayit  : %d  (tahminlere DOKUNULMADI)" % n_before)
+        print()
+        for k in ("team_name", "team_id", "application_id"):
+            print("  %-16s %r -> %r" % (k, old[k], doc2[k]))
+        print()
+        print("yazildi: %s  (%.1f KB)" % (out, os.path.getsize(out) / 1024))
+        print("diskten geri okundu ve tekrar dogrulandi.")
+        print()
+        print("all checks passed")
+        return 0
 
     # ---- yalnizca dogrulama modu ------------------------------------------
     if args.validate:
