@@ -250,6 +250,132 @@ def prebuild_sessions(pr, models_dir, intra, inter=1):
         len(built), intra, inter)
 
 
+# ---- model-ici paralellik -------------------------------------------------
+# 20 ONNX'i tek kayit icinde paralel kosturmak isteniyor. Sorun: ensemble
+# toplami `predict.py` ICINDE yapiliyor ve o dosya DEGISMEYECEK. Toplami
+# disarida yeniden yazmak, gormedigim bir mantigi (agirliklar, olcekleme,
+# normalizasyon) taklit etmek demek olurdu -- dogrulanmis 0.841204'ten sessizce
+# sapma riski.
+#
+# Bunun yerine OTURUMLAR sarmalaniyor. `predict.py` yine kendi dongusunu
+# manifest sirasiyla kosar ve toplami kendi yapar; ilk `.run()` cagrisi
+# 20 modelin HEPSINI ThreadPoolExecutor ile baslatir, sonuclar INDEKSE gore
+# saklanir, sonraki 19 cagri onbellekten doner.
+#
+# Bu sayede:
+#   * her kayit yalnizca bir kez on islenir (predict_record degismedi)
+#   * her model kendi mevcut oturumunu kullanir
+#   * sonuclar bitirme sirasiyla degil, manifest indeksiyle yerlestirilir
+#   * float toplama sirasi predict.py'de, manifest sirasinda KALIR
+#   * cikti bit-birebir ayni olmali (toplami yapan kod ayni kod)
+
+class _ParallelRunner:
+    """20 oturumu tek seferde paralel kosturur, sonuclari indekse gore saklar."""
+
+    def __init__(self, n_workers):
+        import threading                          # noqa: PLC0415
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+        self._pool = ThreadPoolExecutor(max_workers=int(n_workers))
+        self._lock = threading.Lock()
+        self._sessions = {}                       # indeks -> gercek oturum
+        self._key = None
+        self._results = {}
+
+    def proxy(self, idx, sess):
+        self._sessions[idx] = sess
+        return _SessionProxy(self, idx, sess)
+
+    @staticmethod
+    def _feed_key(output_names, feed):
+        import hashlib                            # noqa: PLC0415
+        h = hashlib.blake2b(digest_size=16)
+        h.update(repr(output_names).encode())
+        for k in sorted(feed):
+            v = np.ascontiguousarray(feed[k])
+            h.update(k.encode())
+            h.update(str(v.dtype).encode())
+            h.update(str(v.shape).encode())
+            h.update(v.tobytes())
+        return h.digest()
+
+    def run(self, idx, output_names, feed, run_options=None):
+        key = self._feed_key(output_names, feed)
+        with self._lock:
+            if key != self._key:
+                # Girdi degisti -> 20 modeli birlikte kostur. Sonuclar
+                # future'lardan INDEKSE gore toplanir; bitirme sirasi onemsiz.
+                futs = {i: self._pool.submit(s.run, output_names, feed,
+                                             run_options)
+                        for i, s in self._sessions.items()}
+                self._results = {i: f.result() for i, f in futs.items()}
+                self._key = key
+            return self._results[idx]
+
+    def close(self):
+        self._pool.shutdown(wait=True)
+
+
+class _SessionProxy:
+    """Bir ONNX oturumu gibi davranir; `.run()` cagrisini havuza yonlendirir."""
+
+    def __init__(self, runner, idx, sess):
+        self._runner = runner
+        self._idx = idx
+        self._sess = sess
+
+    def run(self, output_names, input_feed, run_options=None):
+        return self._runner.run(self._idx, output_names, input_feed,
+                                run_options)
+
+    def __getattr__(self, name):                  # get_inputs, get_outputs, ...
+        return getattr(self._sess, name)
+
+
+def wrap_sessions_parallel(pr, n_workers):
+    """`pr._SESSIONS` icindeki her oturumu paralel calisan bir vekille degistir.
+
+    `_SESSIONS`'in kap yapisi hakkinda VARSAYIM YAPILMAZ: liste elemani ya
+    dogrudan oturumdur, ya da icinde bir oturum bulunan bir demettir
+    ((manifest_kaydi, oturum) gibi). `.run` metodu olan eleman bulunur ve
+    yalnizca o degistirilir; manifest kaydi oldugu gibi kalir.
+
+    Dondurur: (sarmalanan_sayi, restore, runner, aciklama)
+    """
+    seq = getattr(pr, "_SESSIONS", None)
+    if not isinstance(seq, (list, tuple)) or not seq:
+        return 0, None, None, "_SESSIONS listesi yok ya da bos"
+
+    runner = _ParallelRunner(n_workers)
+    new = []
+    for i, item in enumerate(seq):
+        if hasattr(item, "run"):                  # [oturum, ...]
+            new.append(runner.proxy(i, item))
+            continue
+        if isinstance(item, (list, tuple)):       # [(kayit, oturum), ...]
+            parts = list(item)
+            for j, p in enumerate(parts):
+                if hasattr(p, "run"):
+                    parts[j] = runner.proxy(i, p)
+                    break
+            else:
+                runner.close()
+                return 0, None, None, "%d. uyede oturum bulunamadi" % i
+            new.append(tuple(parts) if isinstance(item, tuple) else parts)
+            continue
+        runner.close()
+        return 0, None, None, "%d. uye taninmadi (%s)" % (i, type(item).__name__)
+
+    old = pr._SESSIONS
+
+    def restore():
+        pr._SESSIONS = old
+        runner.close()
+
+    pr._SESSIONS = new if isinstance(seq, list) else tuple(new)
+    return len(new), restore, runner, "%d model %d is parcaciginda paralel" % (
+        len(new), n_workers)
+
+
 def filter_backend():
     """ecg_preprocess hangi filtre arka ucunu kullaniyor: scipy mi, saf numpy mi."""
     try:
@@ -482,6 +608,8 @@ def main(argv=None):
                     help="kac surecte paralel kosulsun (1 = seri, varsayilan). "
                          "Her kayit bagimsiz; sonuc DEGISMEZ, yalnizca hizlanir. "
                          "0 = cekirdek sayisi.")
+    ap.add_argument("--model-parallel", type=int, default=0, metavar="N",
+                    help="Tek kayit icindeki 20 ONNX cikarimini N is\n                         parcaciginda paralel kostur (ThreadPoolExecutor).\n                         0 veya 1 = seri, mevcut davranis. --workers ile\n                         BIRLIKTE KULLANILAMAZ.")
     ap.add_argument("--cache-sessions", action="store_true",
                     help="pr.sessions()'i onbellege al. Bazi paketlerde "
                          "predict_record her kayitta 20 ONNX'i yeniden "
@@ -493,6 +621,20 @@ def main(argv=None):
                          "kosturmaz). --team-name/--team-id/--application-id "
                          "ve --out ile birlikte kullanilir.")
     args = ap.parse_args(argv)
+
+    # Iki paralellik katmani ayni anda calisirsa cekirdekler N*M kez
+    # asiri abone olur ve ikisi de yavaslar. Sessizce birini secmek yerine
+    # acikca REDDET -- kullanici hangisini istedigini bilsin.
+    if args.model_parallel > 1 and args.workers not in (0, 1):
+        raise SystemExit(
+            "--model-parallel %d ve --workers %d BIRLIKTE kullanilamaz.\n"
+            "  Iki paralellik katmani cekirdekleri %dx asiri abone eder.\n"
+            "  Birini secin:\n"
+            "    --model-parallel %d            (kayit ici, 20 model paralel)\n"
+            "    --workers %d --threads 2       (kayitlar arasi)"
+            % (args.model_parallel, args.workers,
+               args.model_parallel * args.workers,
+               args.model_parallel, args.workers))
 
     # ---- kimlik degistirme modu -------------------------------------------
     # 90+ dakikalik bir kosuyu yalnizca team_id degistirmek icin tekrarlamak
@@ -772,6 +914,21 @@ def main(argv=None):
         print("model          : %d ONNX grafigi" % n_models)
         print("siniflar       : %s" % ", ".join(pkg_classes))
 
+        # ---- model-ici paralellik --------------------------------------
+        # Oturumlar sarmalanir; ensemble toplami predict.py icinde,
+        # MANIFEST SIRASINDA kalir. Sonuclar bitirme sirasiyla degil,
+        # model indeksiyle toplanir.
+        mp_restore = None
+        if args.model_parallel > 1:
+            print("model parallel : %d" % args.model_parallel)
+            n_mp, mp_restore, _runner, mp_note = wrap_sessions_parallel(
+                pr, args.model_parallel)
+            if n_mp:
+                print("                 %s" % mp_note)
+            else:
+                print("                 UYGULANAMADI (%s) -- seri devam"
+                      % mp_note)
+
         # ---- ONNX thread ayari ----------------------------------------
         # --threads 0 (varsayilan): hicbir sey yapilmaz, ESKI DAVRANIS.
         # --threads N > 0: 20 oturum, cikarim BASLAMADAN once acik
@@ -795,6 +952,7 @@ def main(argv=None):
             print("ONNX thread    : ORT varsayilani (tum cekirdekler)")
             print("                 Kucuk 1B modellerde YAVAS olabilir; "
                   "--threads 2 deneyin.")
+
         fb = filter_backend()
         if fb:
             print("filtre arka ucu: %s%s" % (fb, "   <-- scipy kurulu degil, "
@@ -849,6 +1007,11 @@ def main(argv=None):
         # Onceden kurdugumuz _SESSIONS'in yapisi pakete UYMAMIS olabilir.
         # Oyleyse eski haline don ve tekrar dene: force_ort_threads zaten
         # import oncesi uygulandigi icin thread ayari yine gecerli olur.
+        if path_form is None and mp_restore is not None:
+            print("  NOT: model-ici paralellik bu pakete uymadi, geri alindi")
+            mp_restore()
+            mp_restore = None
+            path_form, pred_idx, pred_prob, probe_err = probe()
         if path_form is None and sess_restore is not None:
             print("  NOT: onceden kurulan _SESSIONS bu pakete uymadi, geri alindi")
             sess_restore()
