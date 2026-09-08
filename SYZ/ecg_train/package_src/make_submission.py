@@ -109,25 +109,47 @@ def filter_backend():
 _W = {}
 
 
-def _worker_init(threads, cache_sessions):
-    """Her iscide bir kez kosar: is parcaciklarini kis, predict'i yukle."""
-    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
-        os.environ[var] = str(max(1, threads))
+def _worker_init(pkg_dir, threads, cache_sessions):
+    """Her iscide BIR KEZ kosar.
+
+    Isci havuzu kalicidir: bu fonksiyon isci basina bir defa calisir, sonra o
+    isci yuzlerce kaydi ayni process icinde isler. Kayit basina process
+    ACILMAZ ve ONNX oturumlari kayit basina yeniden kurulmaz.
+    """
+    # Is parcaciklarini KISITLA: N isci x M thread = asiri abonelik demek olur.
+    # onnxruntime bunlari import aninda okur, o yuzden importtan ONCE.
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = str(max(1, int(threads)))
+    if pkg_dir and pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
     sys.path.insert(0, HERE)
     import predict as pr                        # noqa: PLC0415
     if cache_sessions:
         memoize_sessions(pr)
+        # Oturumlari SIMDI kur: ilk kayit bu bedeli odemesin ve butun
+        # isciler ayni anda degil, baslangicta yuklesin.
+        try:
+            if hasattr(pr, "sessions"):
+                pr.sessions()
+        except Exception:                       # noqa: BLE001
+            pass                                # ilk kayitta yine denenecek
     _W["pr"] = pr
 
 
 def _worker_one(job):
-    """Tek kayit: (sira, yol) -> (sira, olasilik, hata)."""
+    """Tek kayit: (sira, yol) -> (sira, sinif_indeksi, olasilik, hata).
+
+    Sira numarasi geri dondurulur; ana surec sonuclari bu indekse gore
+    yerlestirir, boylece --ids sirasi havuzun bitirme sirasindan bagimsiz
+    olarak birebir korunur.
+    """
     i, path = job
     try:
-        _idx, p = _W["pr"].predict_record(path)
-        return i, np.asarray(p, dtype=np.float64).ravel(), None
+        idx, p = _W["pr"].predict_record(path)
+        return i, idx, np.asarray(p, dtype=np.float64).ravel(), None
     except Exception as exc:                    # noqa: BLE001
-        return i, None, "%s: %s" % (type(exc).__name__, exc)
+        return i, None, None, "%s: %s" % (type(exc).__name__, exc)
 
 
 # --------------------------------------------------------------------------
@@ -281,7 +303,10 @@ def main(argv=None):
     ap.add_argument("--ids", default="",
                     help="id listesi (csv/txt). Verilmezse --root taranir.")
     ap.add_argument("--models", default=HERE, help="paket klasoru")
-    ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--threads", type=int, default=0,
+                    help="Bundle yolunda ONNX intra-op thread sayisi. "
+                         "--workers ile birlikte: ISCI BASINA thread "
+                         "(0 = cekirdekleri isciler arasinda bolustur).")
     ap.add_argument("--team-name", default="")
     ap.add_argument("--team-id", default="")
     ap.add_argument("--application-id", default="")
@@ -516,6 +541,9 @@ def main(argv=None):
         n_lead = int(getattr(ep, "N_LEADS", 12))
         extra = bool(getattr(bundle, "extra_features", False))
 
+        if args.workers not in (0, 1):
+            print("  UYARI: --workers yalnizca predict_record yolunda "
+                  "gecerli; Bundle yolunda yok sayildi.")
         print("API            : Bundle (klasik paket)")
         print("model          : %d ONNX grafigi" % len(bundle))
         print("ozellik sayisi : %d%s" % (n_feat, "  (+artik olcumleri)" if extra else ""))
@@ -656,21 +684,30 @@ def main(argv=None):
         store(0, order[0], pred_idx, pred_prob)     # ilk kaydi tekrar kosma
 
         if n_workers > 1:
-            # Paralel yol. Kayitlar bagimsiz oldugu icin yalnizca sira degisir,
-            # sonuc degismez -- kabul kapisi: uretilen JSON seri kosuyla
-            # BIREBIR ayni olmali.
+            # Paralel yol. Kayitlar birbirinden bagimsiz oldugu icin paralellik
+            # yalnizca ISLEME SIRASINI degistirir, sonucu degil. Sonuclar sira
+            # numarasina gore yerlestirilir; --ids sirasi birebir korunur.
+            # Kabul kapisi: uretilen JSON seri kosuyla BIREBIR ayni olmali.
             import multiprocessing as mp             # noqa: PLC0415
             jobs = [(i, record_arg(order[i])) for i in range(1, len(order))]
-            per_worker = max(1, args.threads or (os.cpu_count() or n_workers) // n_workers)
+            # N isci x M thread asiri abonelik yapar; cekirdekleri bolustur.
+            per_worker = args.threads or max(1, (os.cpu_count() or n_workers)
+                                             // n_workers)
             done = 1
-            ctx = mp.get_context("spawn")            # Windows ile ayni davranis
+            # "spawn": Windows'un tek baslatma yontemi. Linux'ta da bunu
+            # secerek ayni kod yolunu (yeniden import + pickle) zorluyoruz.
+            ctx = mp.get_context("spawn")
+            print("  isci basina thread: %d  (baslatma: spawn)" % per_worker)
             with ctx.Pool(n_workers, initializer=_worker_init,
-                          initargs=(per_worker, args.cache_sessions)) as pool:
-                for i, p, err in pool.imap_unordered(_worker_one, jobs,
-                                                     chunksize=4):
+                          initargs=(args.models, per_worker,
+                                    args.cache_sessions)) as pool:
+                # chunksize: her isci TEK SEFERDE birden cok kayit alir, boylece
+                # kayit basina process/IPC maliyeti odenmez.
+                for i, idx, p, err in pool.imap_unordered(_worker_one, jobs,
+                                                          chunksize=8):
                     if err is None:
                         try:
-                            prob[i] = sanitize_prob(p)
+                            store(i, order[i], idx, sanitize_prob(p))
                         except ValueError as ve:
                             err = "olasilik hata: %s" % ve
                     if err is not None:
