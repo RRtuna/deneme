@@ -141,19 +141,27 @@ def force_ort_threads(intra, inter=1):
     if getattr(orig, "_ms_threads", None) is not None:
         return False
 
-    def patched(path_or_bytes, sess_options=None, providers=None, **kw):
-        so = sess_options if sess_options is not None else ort.SessionOptions()
-        so.intra_op_num_threads = int(intra)
-        so.inter_op_num_threads = int(inter)
-        try:
-            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        except Exception:                        # noqa: BLE001
-            pass
-        return orig(path_or_bytes, so, providers=providers, **kw)
+    # ALT SINIF olmali, fonksiyon degil. `predict.py` bir yerde
+    # `isinstance(s, ort.InferenceSession)` yaparsa (ya da tip olarak
+    # kullanirsa), sinifi fonksiyonla degistirmek
+    #     TypeError: isinstance() arg 2 must be a type
+    # ile patlar. Alt sinif hem ayari uygular hem tip kimligini korur.
+    class _ThreadedSession(orig):
+        def __init__(self, path_or_bytes, sess_options=None,
+                     providers=None, **kw):
+            so = sess_options if sess_options is not None \
+                else ort.SessionOptions()
+            so.intra_op_num_threads = int(intra)
+            so.inter_op_num_threads = int(inter)
+            try:
+                so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            except Exception:                    # noqa: BLE001
+                pass
+            super().__init__(path_or_bytes, so, providers=providers, **kw)
 
-    patched._ms_threads = (int(intra), int(inter))
-    patched._ms_orig = orig
-    ort.InferenceSession = patched
+    _ThreadedSession._ms_threads = (int(intra), int(inter))
+    _ThreadedSession._ms_orig = orig
+    ort.InferenceSession = _ThreadedSession
     return True
 
 
@@ -194,9 +202,12 @@ def prebuild_sessions(pr, models_dir, intra, inter=1):
     except Exception as exc:                     # noqa: BLE001
         return 0, None, "onnxruntime yok: %s" % exc
 
-    # Yamali InferenceSession varsa ORIJINALINI kullan; asagida zaten acik
-    # SessionOptions veriyoruz, iki kez ayarlamaya gerek yok.
-    mk = getattr(ort.InferenceSession, "_ms_orig", ort.InferenceSession)
+    # GUNCEL sinifi kullan (yamaliysa yamalisini). Boylece kurulan oturumlar
+    # `isinstance(s, ort.InferenceSession)` kontrolunden gecer -- predict.py
+    # boyle bir kontrol yapiyorsa orijinal sinifla kurmak onu kirardi.
+    # Acik SessionOptions verdigimiz icin alt sinif ayni degerleri tekrar
+    # yazar, zararsiz.
+    mk = ort.InferenceSession
 
     def resolve(entry):
         if isinstance(entry, str):
@@ -331,6 +342,32 @@ class _SessionProxy:
         return getattr(self._sess, name)
 
 
+def ensure_sessions(pr):
+    """`pr._SESSIONS` bos ise paketin KENDI kurulumunu tetikle.
+
+    `--threads` verilmediginde oturumlar tembel kurulur ve ilk kayda kadar
+    `_SESSIONS` None kalir. Sarmalayici o anda bos listeye bakip sessizce
+    devre disi kalirdi. Burada `pr.sessions()` cagrilarak kurulum one alinir;
+    kurulum yine PAKETIN kendi kodudur, hicbir sey degistirilmez.
+
+    Dondurur: (hazir_mi, aciklama)
+    """
+    seq = getattr(pr, "_SESSIONS", None)
+    if isinstance(seq, (list, tuple)) and seq:
+        return True, "_SESSIONS zaten kurulu"
+    fn = getattr(pr, "sessions", None)
+    if fn is None:
+        return False, "_SESSIONS bos ve pr.sessions() yok"
+    try:
+        fn()
+    except Exception as exc:                     # noqa: BLE001
+        return False, "pr.sessions() hata verdi: %s" % exc
+    seq = getattr(pr, "_SESSIONS", None)
+    if isinstance(seq, (list, tuple)) and seq:
+        return True, "pr.sessions() ile kuruldu"
+    return False, "pr.sessions() sonrasi _SESSIONS hala bos"
+
+
 def wrap_sessions_parallel(pr, n_workers):
     """`pr._SESSIONS` icindeki her oturumu paralel calisan bir vekille degistir.
 
@@ -372,8 +409,9 @@ def wrap_sessions_parallel(pr, n_workers):
         runner.close()
 
     pr._SESSIONS = new if isinstance(seq, list) else tuple(new)
-    return len(new), restore, runner, "%d model %d is parcaciginda paralel" % (
-        len(new), n_workers)
+    return len(new), restore, runner, \
+        "%d oturum model-ici paralellik icin sarildi (%d is parcacigi)" % (
+            len(new), n_workers)
 
 
 def filter_backend():
@@ -914,25 +952,15 @@ def main(argv=None):
         print("model          : %d ONNX grafigi" % n_models)
         print("siniflar       : %s" % ", ".join(pkg_classes))
 
-        # ---- model-ici paralellik --------------------------------------
-        # Oturumlar sarmalanir; ensemble toplami predict.py icinde,
-        # MANIFEST SIRASINDA kalir. Sonuclar bitirme sirasiyla degil,
-        # model indeksiyle toplanir.
-        mp_restore = None
-        if args.model_parallel > 1:
-            print("model parallel : %d" % args.model_parallel)
-            n_mp, mp_restore, _runner, mp_note = wrap_sessions_parallel(
-                pr, args.model_parallel)
-            if n_mp:
-                print("                 %s" % mp_note)
-            else:
-                print("                 UYGULANAMADI (%s) -- seri devam"
-                      % mp_note)
-
-        # ---- ONNX thread ayari ----------------------------------------
+        # ---- 1) ONNX thread ayari -- OTURUMLARI KURAN ADIM -----------------
+        # SIRA KRITIK: model-ici paralellik, oturumlarin UZERINE sarilir.
+        # Once oturumlar var olmali. (Ilk surumde bu blok model-parallel'den
+        # SONRA geliyordu; sarmalayici _SESSIONS = None uzerinde calisip
+        # sessizce devre disi kaliyordu.)
+        #
         # --threads 0 (varsayilan): hicbir sey yapilmaz, ESKI DAVRANIS.
         # --threads N > 0: 20 oturum, cikarim BASLAMADAN once acik
-        # SessionOptions ile yeniden kurulup pr._SESSIONS'a yerlestirilir.
+        # SessionOptions ile kurulup pr._SESSIONS'a yerlestirilir.
         # predict.py degismez; sonra onun predict_record'u aynen kullanilir.
         sess_restore = None
         if args.threads:
@@ -952,6 +980,29 @@ def main(argv=None):
             print("ONNX thread    : ORT varsayilani (tum cekirdekler)")
             print("                 Kucuk 1B modellerde YAVAS olabilir; "
                   "--threads 2 deneyin.")
+
+        # ---- 2) model-ici paralellik -- MEVCUT oturumlarin UZERINE ---------
+        # Oturumlar sarmalanir; ensemble toplami predict.py icinde,
+        # MANIFEST SIRASINDA kalir. Sonuclar bitirme sirasiyla degil,
+        # model indeksiyle toplanir.
+        mp_restore = None
+        if args.model_parallel > 1:
+            print("model parallel : %d" % args.model_parallel)
+            # --threads verilmediyse oturumlar hala tembel/kurulmamis olabilir.
+            # Sarmalamadan once paketin kendi kurulumunu tetikle, yoksa
+            # sarmalayici bos listeye bakip sessizce devre disi kalir.
+            ready, ready_note = ensure_sessions(pr)
+            if not ready:
+                print("                 UYGULANAMADI (%s) -- seri devam"
+                      % ready_note)
+            else:
+                n_mp, mp_restore, _runner, mp_note = wrap_sessions_parallel(
+                    pr, args.model_parallel)
+                if n_mp:
+                    print("                 %s" % mp_note)
+                else:
+                    print("                 UYGULANAMADI (%s) -- seri devam"
+                          % mp_note)
 
         fb = filter_backend()
         if fb:
