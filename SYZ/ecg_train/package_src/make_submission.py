@@ -56,6 +56,81 @@ TOL = 0.001
 
 
 # --------------------------------------------------------------------------
+# hizlandirma -- predict.py'ye DOKUNMADAN, calisma aninda
+# --------------------------------------------------------------------------
+# Olculen gercek maliyet (750 kayit, 7357 ms/kayit):
+#   ~4.2 sn  ONNX oturumlarinin HER KAYITTA yeniden kurulmasi
+#   ~1.0 sn  scipy yokken saf-Python ornek-ornek filtre dongusu
+#   ~0.3 sn  20 modelin saf cikarimi
+# Ikisi de paketin kendi dosyalarina dokunmadan giderilebilir. Her ikisi de
+# CIKTIYI DEGISTIRMEZ; --workers ile birlikte kabul kapisi hep aynidir:
+# uretilen JSON referans dosyayla BIREBIR ayni olmali.
+
+def memoize_sessions(pr):
+    """pr.sessions()'i onbellege al.
+
+    Bazi paketlerde `predict_record` her cagride `sessions()` cagirir ve o da
+    20 ONNX grafigini (101 MB) yeniden yukler. Oturumlar cikarim icin
+    durumsuzdur, tekrar kullanilmalari guvenlidir ve sonucu degistirmez.
+    Zaten onbellekliyse bu sarmalayici zararsiz bir no-op olur.
+
+    Dondurur: sarmalandiysa True.
+    """
+    fn = getattr(pr, "sessions", None)
+    if fn is None or getattr(fn, "_ms_cached", False):
+        return False
+    box = {}
+
+    def cached(*a, **k):
+        if "v" not in box:
+            box["v"] = fn(*a, **k)
+        return box["v"]
+
+    cached._ms_cached = True
+    cached._ms_orig = fn
+    pr.sessions = cached
+    return True
+
+
+def filter_backend():
+    """ecg_preprocess hangi filtre arka ucunu kullaniyor: scipy mi, saf numpy mi."""
+    try:
+        import ecg_preprocess as ep             # noqa: PLC0415
+        return getattr(ep, "FILTER_BACKEND", None)
+    except Exception:                           # noqa: BLE001
+        return None
+
+
+# ---- surec paralelligi ----------------------------------------------------
+# Her kayit bagimsiz islenir; paralellik yalnizca SIRAYI degistirir, sonucu
+# degil. Isci durumu modul seviyesinde tutulur cunku Windows'ta multiprocessing
+# "spawn" kullanir ve isci fonksiyonunun picklelenebilir olmasi gerekir.
+
+_W = {}
+
+
+def _worker_init(threads, cache_sessions):
+    """Her iscide bir kez kosar: is parcaciklarini kis, predict'i yukle."""
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ[var] = str(max(1, threads))
+    sys.path.insert(0, HERE)
+    import predict as pr                        # noqa: PLC0415
+    if cache_sessions:
+        memoize_sessions(pr)
+    _W["pr"] = pr
+
+
+def _worker_one(job):
+    """Tek kayit: (sira, yol) -> (sira, olasilik, hata)."""
+    i, path = job
+    try:
+        _idx, p = _W["pr"].predict_record(path)
+        return i, np.asarray(p, dtype=np.float64).ravel(), None
+    except Exception as exc:                    # noqa: BLE001
+        return i, None, "%s: %s" % (type(exc).__name__, exc)
+
+
+# --------------------------------------------------------------------------
 # dogrulama -- teslimden once HER SEY buradan gecmeli
 # --------------------------------------------------------------------------
 
@@ -216,6 +291,15 @@ def main(argv=None):
                          "(-1 = otomatik: kayitlarin %%1'i, en az 5)")
     ap.add_argument("--validate", default="",
                     help="uretme, VAR OLAN bir json'u denetle")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="kac surecte paralel kosulsun (1 = seri, varsayilan). "
+                         "Her kayit bagimsiz; sonuc DEGISMEZ, yalnizca hizlanir. "
+                         "0 = cekirdek sayisi.")
+    ap.add_argument("--cache-sessions", action="store_true",
+                    help="pr.sessions()'i onbellege al. Bazi paketlerde "
+                         "predict_record her kayitta 20 ONNX'i yeniden "
+                         "yukluyor; bu onu engeller. Zaten onbellekliyse "
+                         "etkisizdir. Sonucu DEGISTIRMEZ.")
     ap.add_argument("--retag", default="",
                     help="VAR OLAN bir json'un yalniz kimlik alanlarini "
                          "degistir (tahminlere DOKUNMAZ, modeli tekrar "
@@ -492,6 +576,22 @@ def main(argv=None):
         print("model          : %d ONNX grafigi" % n_models)
         print("siniflar       : %s" % ", ".join(pkg_classes))
 
+        fb = filter_backend()
+        if fb:
+            print("filtre arka ucu: %s%s" % (fb, "   <-- scipy kurulu degil, "
+                                             "on isleme ~60x yavas"
+                                             if fb == "numpy" else ""))
+        if args.cache_sessions:
+            print("oturum onbellegi: %s"
+                  % ("ACIK" if memoize_sessions(pr) else "gerekmedi (zaten onbellekli)"))
+
+        n_workers = args.workers
+        if n_workers == 0:
+            n_workers = os.cpu_count() or 1
+        n_workers = max(1, min(int(n_workers), len(order)))
+        if n_workers > 1:
+            print("isci sureci    : %d" % n_workers)
+
         if n_models == 0:
             raise SystemExit(
                 "MANIFEST icinde model listesi bulunamadi.\n"
@@ -555,17 +655,43 @@ def main(argv=None):
 
         store(0, order[0], pred_idx, pred_prob)     # ilk kaydi tekrar kosma
 
-        for i in range(1, len(order)):
-            rid = order[i]
-            try:
-                idx, p = pr.predict_record(record_arg(rid))
-                store(i, rid, idx, sanitize_prob(p))
-            except Exception as exc:                 # noqa: BLE001
-                failed.append((rid, "%s: %s" % (type(exc).__name__, exc)))
-                prob[i] = 1.0 / len(CLASS_ORDER)
-            if (i + 1) % 100 == 0 or i + 1 == len(order):
-                print("  tahmin %d/%d  %.0f sn"
-                      % (i + 1, len(order), time.time() - t0), flush=True)
+        if n_workers > 1:
+            # Paralel yol. Kayitlar bagimsiz oldugu icin yalnizca sira degisir,
+            # sonuc degismez -- kabul kapisi: uretilen JSON seri kosuyla
+            # BIREBIR ayni olmali.
+            import multiprocessing as mp             # noqa: PLC0415
+            jobs = [(i, record_arg(order[i])) for i in range(1, len(order))]
+            per_worker = max(1, args.threads or (os.cpu_count() or n_workers) // n_workers)
+            done = 1
+            ctx = mp.get_context("spawn")            # Windows ile ayni davranis
+            with ctx.Pool(n_workers, initializer=_worker_init,
+                          initargs=(per_worker, args.cache_sessions)) as pool:
+                for i, p, err in pool.imap_unordered(_worker_one, jobs,
+                                                     chunksize=4):
+                    if err is None:
+                        try:
+                            prob[i] = sanitize_prob(p)
+                        except ValueError as ve:
+                            err = "olasilik hata: %s" % ve
+                    if err is not None:
+                        failed.append((order[i], err))
+                        prob[i] = 1.0 / len(CLASS_ORDER)
+                    done += 1
+                    if done % 100 == 0 or done == len(order):
+                        print("  tahmin %d/%d  %.0f sn"
+                              % (done, len(order), time.time() - t0), flush=True)
+        else:
+            for i in range(1, len(order)):
+                rid = order[i]
+                try:
+                    idx, p = pr.predict_record(record_arg(rid))
+                    store(i, rid, idx, sanitize_prob(p))
+                except Exception as exc:             # noqa: BLE001
+                    failed.append((rid, "%s: %s" % (type(exc).__name__, exc)))
+                    prob[i] = 1.0 / len(CLASS_ORDER)
+                if (i + 1) % 100 == 0 or i + 1 == len(order):
+                    print("  tahmin %d/%d  %.0f sn"
+                          % (i + 1, len(order), time.time() - t0), flush=True)
 
         elapsed = time.time() - t0
         if argmax_mismatch:
