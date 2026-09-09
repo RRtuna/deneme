@@ -5,9 +5,12 @@
 
 Sartname madde 3.1.1 dis veri kullanimina acikca izin veriyor ve ornek veri
 olarak PhysioNet **ECG Arrhythmia Dataset 1.0.0**'i gosteriyor (~45.000 kayit,
-12 derivasyon, 500 Hz, SNOMED-CT etiketleri). Yarismanin kendi kumesi bu
-kaynakla ayni etiketleme duzenini kullandigi icin, klasik "farkli veri setinden
-gelen etiket konvansiyonu uyusmuyor" riski burada yok.
+12 derivasyon, 500 Hz, SNOMED-CT etiketleri).
+
+DIKKAT: Challenge 2021 havuzu tek bir kaynak DEGILDIR -- Ningbo, Chapman,
+PTB-XL ve Georgia farkli merkezlerden gelir ve SNOMED kodu ayni olsa bile
+AFL/AFIB ayrimi merkezden merkeze degisebilir. Kod haritasi bu farki COZMEZ.
+Tek gercek kontrol fold-0 kapisidir: AFL F1 duserse dis veri zarar veriyordur.
 
 Eklenen kayitlar `split="extra"` alir. `train.py` bunlari **her fold'un egitim
 kismina** koyar, **hicbir fold'un dogrulamasina** koymaz. Boylece OOF skoru
@@ -113,6 +116,105 @@ def stem(path):
 
 
 # --------------------------------------------------------------------------
+# cache sema uyumlulugu
+# --------------------------------------------------------------------------
+# Gercek yarisma cache'i su sutunlari kullaniyor:
+#   record_id, relative_path, header_path, signal_path, label, class_id,
+#   sampling_rate_hz, lead_count, duration_sec, file_format, split
+# Eski/sentetik cache ise: record, path, label(int), label_name.
+# Iki semayi da destekle -- alan adi yuzunden cokme olmasin.
+
+ID_KEYS = ("record_id", "record", "id")
+PATH_KEYS = ("header_path", "path", "hea", "header", "relative_path")
+CLSID_KEYS = ("class_id", "label_id", "y")
+NAME_KEYS = ("label_name", "label", "class", "sinif")
+
+
+def _first(row, keys):
+    for k in keys:
+        v = row.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def row_id(row, fallback=""):
+    v = _first(row, ID_KEYS)
+    return str(v) if v is not None else fallback
+
+
+def row_class(row, classes):
+    """(sinif_indeksi, sinif_adi). Iki semada da calisir.
+
+    `class_id` varsa o kullanilir. Yoksa `label` sayisal ise indeks, metin ise
+    ad kabul edilir -- gercek semada `label` ADdir, eski semada INT'ti.
+    """
+    idx = None
+    v = _first(row, CLSID_KEYS)
+    if v is not None:
+        try:
+            idx = int(str(v).strip())
+        except (TypeError, ValueError):
+            idx = None
+
+    name = None
+    for k in NAME_KEYS:
+        v = row.get(k)
+        if v in (None, ""):
+            continue
+        s = str(v).strip()
+        if s.lstrip("-").isdigit():
+            if idx is None:
+                idx = int(s)
+            continue
+        name = s
+        break
+
+    if name is None and idx is not None and 0 <= idx < len(classes):
+        name = classes[idx]
+    if idx is None and name is not None:
+        low = {c.lower(): i for i, c in enumerate(classes)}
+        idx = low.get(name.lower())
+    return idx, (name or "")
+
+
+def resolve_header(raw, project_root, data_root):
+    """index.csv'deki yolu bu makinedeki GERCEK dosyaya cevir.
+
+    Gercek cache'te `header_path` = "data/Normal/NORM_000777/JS36591.hea"
+    ama dosya <VERI_KOKU>/Normal/NORM_000777/JS36591.hea altinda duruyor.
+    Sirayla denenir:
+      1. oldugu gibi
+      2. proje kokune gore
+      3. veri kokune gore
+      4. "data/" oneki atilip veri kokune gore (sonra proje kokune gore)
+    Bulunamazsa None -- ve None sayisi sizinti taramasinin KOR NOKTASIDIR,
+    o yuzden cagiran taraf sayar ve gerekirse reddeder.
+    """
+    if not raw:
+        return None
+    p = str(raw).replace("\\", os.sep).replace("/", os.sep)
+    if os.path.exists(p):
+        return p
+    cands = []
+    for root in (project_root, data_root):
+        if root:
+            cands.append(os.path.join(root, p))
+    low = p.lower()
+    for pref in ("data" + os.sep, "data/"):
+        if low.startswith(pref):
+            tail = p[len(pref):]
+            for root in (data_root, project_root):
+                if root:
+                    cands.append(os.path.join(root, tail))
+            break
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+# --------------------------------------------------------------------------
 # imzalar
 # --------------------------------------------------------------------------
 
@@ -176,7 +278,18 @@ def main(argv=None):
                     help="yalnizca TEK hedef tani tasiyan kayitlari al (varsayilan)")
     ap.add_argument("--allow-multi", dest="single_label", action="store_false",
                     help="birden fazla hedef tani tasiyan kayitlari da al")
+    ap.add_argument("--project-root", default="",
+                    help="index.csv yollarinin cozulecegi proje koku "
+                         "(bos = calisma dizini)")
+    ap.add_argument("--data-root", default="",
+                    help="ham kayitlarin koku (bos = proje kokunun ust "
+                         "klasoru). header_path 'data/...' ile "
+                         "basliyorsa bu onek atilip buraya gore cozulur.")
     args = ap.parse_args(argv)
+
+    project_root = os.path.abspath(args.project_root or os.getcwd())
+    data_root = os.path.abspath(args.data_root
+                                or os.path.dirname(project_root))
 
     classes = list(ep.CLASSES)
     want = set(c.strip() for c in args.only.split(",") if c.strip()) or set(classes)
@@ -195,6 +308,8 @@ def main(argv=None):
     meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
     target_fs = float(meta.get("target_fs") or ep.TARGET_FS)
 
+    print("proje koku      : %s" % project_root)
+    print("veri koku       : %s" % data_root)
     print("yarisma cache'i : %s  (%d kayit)" % (args.cache, len(rows)))
     print("kaynak          : %s" % args.source)
     hea = scan_source(args.source)
@@ -207,27 +322,51 @@ def main(argv=None):
     print("1/4  yarisma kayitlarinin imzalari cikariliyor")
     t0 = time.time()
     own_stem, own_shape, own_vecs, own_label, own_split = {}, {}, [], [], []
+    own_path = {}                                # satir -> cozulmus gercek yol
+    n_unresolved = n_unreadable = 0
+    example_missing = []
     for i, r in enumerate(rows):
-        p = r.get("path") or ""
-        if not p or not os.path.exists(p):
+        raw = _first(r, PATH_KEYS) or ""
+        p = resolve_header(raw, project_root, data_root)
+        if p is None:
+            n_unresolved += 1
+            if len(example_missing) < 5:
+                example_missing.append(raw)
             continue
         try:
             sig, _fs = load_signal(p)
         except Exception:                        # noqa: BLE001
+            n_unreadable += 1
+            if len(example_missing) < 5:
+                example_missing.append(p)
             continue
         sh, v = fingerprint(sig)
+        own_path[i] = p
+        # Stem, RECORD_ID degil COZULMUS DOSYA ADI olmali: gercek cache'te
+        # record_id "NORM_000777" ama dosya "JS36591.hea". Kaynaktaki kopya
+        # JS36591 adiyla duruyor -- record_id ile karsilastirsak kacirirdik.
         own_stem[stem(p)] = i
         own_shape[sh] = i
         own_vecs.append(v)
-        own_label.append(r.get("label_name") or "")
+        own_label.append(row_class(r, classes)[1])
         own_split.append(r.get("split") or "")
         if (i + 1) % 1000 == 0:
             print("     %5d/%d  %.0f sn" % (i + 1, len(rows), time.time() - t0),
                   flush=True)
+
+    n_ok = len(own_vecs)
+    print("     competition readable: %d/%d" % (n_ok, len(rows)))
+    if n_unresolved or n_unreadable:
+        print("     yol cozulemedi: %d   okunamadi: %d" % (n_unresolved,
+                                                           n_unreadable))
+        for e in example_missing:
+            print("       ornek: %s" % e)
+        print("     --project-root / --data-root dogru mu?")
     if not own_vecs:
         raise SystemExit(
-            "Hicbir yarisma kaydi okunamadi.\n"
-            "  index.csv'deki 'path' sutunu bu makinede gecerli mi?\n"
+            "Hicbir yarisma kaydi OKUNAMADI.\n"
+            "  index.csv yol sutunu (header_path/path) bu makinede cozulmuyor.\n"
+            "  --project-root ve --data-root ver.\n"
             "  Cakisma taramasi yapilamadan dis veri EKLENEMEZ -- sizinti riski.")
     OWN = np.stack(own_vecs)
     own_label = np.array(own_label)
@@ -248,7 +387,7 @@ def main(argv=None):
         if not codes:
             continue
         n_matched += 1
-        lab = rows[i].get("label_name") or ""
+        lab = row_class(rows[i], classes)[1]
         for c in codes:
             votes[lab][c] += 1
 
@@ -262,8 +401,8 @@ def main(argv=None):
                 totals[c] += n
         for lab, cnt in votes.items():
             n_lab = sum(1 for st, i in own_stem.items()
-                        if (rows[i].get("label_name") or "") == lab
-                        and stem(rows[i].get("path", "")) in src_by_stem)
+                        if row_class(rows[i], classes)[1] == lab
+                        and stem(own_path.get(i, "")) in src_by_stem)
             keep = [c for c, n in cnt.items()
                     if n >= 0.5 * max(n_lab, 1) and n >= 0.9 * totals[c]]
             if keep:
@@ -444,11 +583,47 @@ def main(argv=None):
                   + "".join("%9d" % by_src[sname][c] for c in classes)
                   + "%9d" % sum(by_src[sname].values()))
 
+    # ---- OZET ------------------------------------------------------------
+    print()
+    print("=" * 62)
+    print("competition readable   : %d/%d" % (n_ok, len(rows)))
+    print("external .hea          : %d" % len(hea))
+    print("exact/signature leaks  : %d" % (dup_shape + dup_corr))
+    print("stem-only overlaps     : %d"
+          % skipped.get("ad cakismasi (senin kaydin)", 0))
+    print("KABUL EDILEN           : %d" % len(accepted))
+    print("=" * 62)
+
+    if n_ok < len(rows):
+        print()
+        print("!! %d yarisma kaydi OKUNAMADI." % (len(rows) - n_ok))
+        print("!! Okunmayan her kayit, sizinti taramasinin KOR NOKTASIDIR:")
+        print("!! o kaydin kaynaktaki kopyasi yakalanmadan egitime girebilir")
+        print("!! ve bunu OOF'ta GOREMEZSIN -- skor yukselir, gercek basari duser.")
+
     if args.dry_run:
         print()
         print("--dry-run: hicbir sey yazilmadi.")
-        print("Sayilar makul gorunuyorsa --dry-run'i kaldirip tekrar calistir.")
+        if n_ok < len(rows):
+            print("Once yol sorununu coz (--project-root / --data-root),")
+            print("sonra --dry-run'i kaldir.")
+        else:
+            print("Sayilar makul gorunuyorsa --dry-run'i kaldirip tekrar calistir.")
         return 0
+
+    # Cache YAZILMADAN once sert kapi: tum yarisma kayitlari okunmus olmali.
+    # Eksik okunan her kayit taranmamis demektir; "leak=0" ciktisi o durumda
+    # bir kanit degil, bir yaniltmadir.
+    if n_ok < len(rows):
+        raise SystemExit(
+            "\nCACHE YAZILMADI -- %d/%d yarisma kaydi okunabildi.\n"
+            "  Sizinti taramasi EKSIK yapildi; bu haliyle dis veri eklemek\n"
+            "  test uzerinde egitme riskidir ve OOF bunu gostermez.\n"
+            "  Yollari duzelt:\n"
+            "    --project-root <index.csv yollarinin koku>\n"
+            "    --data-root    <ham kayitlarin koku>\n"
+            "  Bilerek devam etmenin guvenli bir yolu YOK; once yolu duzelt."
+            % (n_ok, len(rows)))
     if not accepted:
         raise SystemExit("kabul edilen kayit yok, cache yazilmadi")
 
@@ -467,7 +642,7 @@ def main(argv=None):
                                   dtype=np.float32, shape=(n_new, n_lead, T))
     X[:n_old] = X_old
     y = np.concatenate([y_old,
-                        np.array([classes.index(l) for _h, l, _s, _f in accepted],
+                        np.array([classes.index(l) for _h, l, _s, _f, _q in accepted],
                                  dtype=y_old.dtype)])
     F = (np.zeros((n_new, F_old.shape[1]), dtype=np.float32)
          if F_old is not None else None)
@@ -495,10 +670,14 @@ def main(argv=None):
     bad_paths = {h for h, _e in bad}
     with open(os.path.join(args.out, "index.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["idx", "record", "path", "label", "label_name", "split", "ok"])
+        w.writerow(["idx", "record_id", "header_path", "class_id",
+                    "label", "split", "ok"])
         for i, r in enumerate(rows):
-            w.writerow([i, r["record"], r.get("path", ""), r["label"],
-                        r.get("label_name", ""), r["split"], r.get("ok", 1)])
+            cid, cname = row_class(r, classes)
+            w.writerow([i, row_id(r, "row%d" % i),
+                        own_path.get(i) or (_first(r, PATH_KEYS) or ""),
+                        cid if cid is not None else "",
+                        cname, r.get("split", ""), r.get("ok", 1)])
         for k, (h, lab, _s, _f, _q) in enumerate(accepted):
             w.writerow([n_old + k, stem(h), h, classes.index(lab), lab,
                         "extra", int(h not in bad_paths)])
