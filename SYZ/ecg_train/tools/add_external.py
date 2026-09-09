@@ -159,6 +159,12 @@ def main(argv=None):
                     help="sinif basina en fazla kac kayit eklensin (0 = sinirsiz)")
     ap.add_argument("--only", default="",
                     help="yalnizca bu siniflar, virgulle (or. AFIB,AFL)")
+    ap.add_argument("--balance-sources", action="store_true",
+                    help="--per-class kotasini sinif icinde KAYNAKLAR "
+                         "arasinda sirayla dagit. Ningbo tek basina 35 bin "
+                         "kayit; dengelenmezse bir sinifin tamami tek "
+                         "kaynaktan gelip model sinifi degil KAYNAGI "
+                         "ogrenebilir.")
     ap.add_argument("--corr-gate", type=float, default=CORR_GATE)
     ap.add_argument("--only-source", default="",
                     help="yalnizca bu kaynaklardan al, virgulle "
@@ -385,8 +391,37 @@ def main(argv=None):
         by = defaultdict(list)
         for item in accepted:
             by[item[1]].append(item)
-        accepted = [it for lab in by for it in by[lab][:args.per_class]]
-        print("     --per-class %d sonrasi: %d" % (args.per_class, len(accepted)))
+        if args.balance_sources:
+            # Sinif icinde KAYNAKLARI sirayla dolas. Ningbo tek basina 35 bin
+            # kayit; duz "ilk N" alinca bir sinifin tamami tek kaynaktan
+            # gelebilir ve model sinifi degil KAYNAGI ogrenmeye baslar.
+            # Bir kaynak tukenirse kalan kota digerlerine gider.
+            picked = []
+            for lab in by:
+                per_src = defaultdict(list)
+                for it in by[lab]:
+                    per_src[it[4]].append(it)          # it[4] = kaynak
+                order = sorted(per_src, key=lambda s: -len(per_src[s]))
+                take, i = [], 0
+                while len(take) < args.per_class:
+                    added = False
+                    for sname in order:
+                        if i < len(per_src[sname]):
+                            take.append(per_src[sname][i])
+                            added = True
+                            if len(take) >= args.per_class:
+                                break
+                    if not added:
+                        break                          # tum kaynaklar tukendi
+                    i += 1
+                picked.extend(take)
+            accepted = picked
+            print("     --per-class %d + kaynak dengeli: %d"
+                  % (args.per_class, len(accepted)))
+        else:
+            accepted = [it for lab in by for it in by[lab][:args.per_class]]
+            print("     --per-class %d sonrasi: %d"
+                  % (args.per_class, len(accepted)))
 
     print()
     print("%-8s %10s %10s %10s" % ("sinif", "senin", "eklenen", "toplam"))
@@ -481,6 +516,7 @@ def main(argv=None):
         "dup_by_corr": dup_corr,
         "corr_gate": args.corr_gate,
         "single_label_only": args.single_label,
+        "balance_sources": args.balance_sources,
         "per_source": {k: dict(v) for k, v in by_src.items()},
         "only_source": sorted(only_src), "exclude_source": sorted(excl_src),
     }
