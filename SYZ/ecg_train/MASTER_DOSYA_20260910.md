@@ -4,9 +4,78 @@
 **Kategori:** Sağlıkta Yapay Zekâ, **Lise Seviyesi**
 **Güncelleme:** 10 Eylül 2026 · **Freeze:** 15 Eylül · **Yarışma:** 16–18 Eylül, Dicle Üniversitesi
 
-> Bu belge, projenin tamamının tek kaynaklı özetidir. Sıfır bağlamla okunabilir:
-> ne yaptık, hangi sayıyı nereden aldık, neyi neden eledik, yarışma günü ne olacak.
-> Bir çelişki görürsen `DENEY_KAYDI.md` ve git geçmişi asıl kayıttır.
+> **v2 — 10 Eylül akşamı düzeltildi.** İlk sürümde üç hatam vardı ve bir
+> hipotezim deneyle çürütüldü; hepsi aşağıda açıkça işaretli.
+>
+> **Kaynak hiyerarşisi:** sayısal bir çelişkide sıra şudur —
+> (1) kodun kendisi, (2) `runs/*/summary.json`, (3) `DENEY_KAYDI.md`,
+> (4) bu belge. Ezberden yazılmış hiçbir sayı sunuma girmemeli.
+
+---
+
+# BÖLÜM 0 — v1'DEKİ HATALARIM
+
+Bu belgenin ilk sürümünde şunlar yanlıştı. Kayda geçiyorlar çünkü sunumun
+omurgası "her iddiayı ölçtük" — kendi iddialarım dahil.
+
+## 0.1 Veri bölünmesini yanlış yazdım
+
+| v1'de yazdığım | gerçek |
+|---|---|
+| 5000 üzerinde 5-fold | **3500 train / 750 val / 750 test_public** |
+| fold-0 val = 1000 kayıt | **dev = 4250, 5-fold → fold val = 850** |
+
+**Sonucu:** fold-0 gürültü tabanı hesabımı n=1000 ile yaptım. n=850 ile
+SE ≈ 0.0117 (0.0108 değil), yani gözlenen −0.021 ≈ **1.8 SE** (1.98 değil).
+Sonuç değişmiyor (sınırda) ama girdi yanlıştı.
+
+## 0.2 "Sınıf öncülü kayması ana neden" hipotezim ÇÜRÜTÜLDÜ
+
+Dış veri fold-0 düşüşünün birinci nedeni olarak sınıf öncülü kaymasını
+göstermiştim. **Test edildi ve yanlış çıktı:**
+
+```
+class-balanced sampler ile epoch exposure = [800, 800, 800, 800, 800]
+val(tta) = 0.8164   vs   baseline 0.8335   →   -0.0171
+```
+
+Öncül düzeltildi, düşüş **devam etti**. Yani sorun sınıf dengesizliği değil;
+domain/etiket uyumsuzluğu daha güçlü aday.
+
+Aynı şekilde `ep30 → ep11`'i bu hipotezin "parmak izi" diye sunmuştum — o
+yorum da dayanaksız kaldı.
+
+## 0.3 Önerdiğim üç deneyin ikisi zaten yapılmıştı
+
+| önerim | durum |
+|---|---|
+| E0 sınıf bazlı F1 kırılımı | zaten yapılmış (AFL300 tablosu mevcut) |
+| E2 öncül korunarak karıştırma | zaten yapılmış, hipotezimi çürüttü |
+| "+300/+300 yapmayın, ayrıştırmaz" | yapılmış: −0.0075, bilgi verdi |
+| "pretrain→finetune'a girmeyin" | yapılmış: −0.0173, net cevap alındı |
+
+Son ikisinde fazla temkinliydim. Deneyler ucuzdu ve **kesin negatif cevap**
+verdiler — bu, belirsizlikte kalmaktan iyi.
+
+## 0.4 Ön işleme sabitlerinde çelişki — ÇÖZÜLMELİ
+
+`TEKNOFEST_ECG_TUM_BILINENLER` belgesi ile depodaki kod uyuşmuyor:
+
+| | o belge | depodaki `ecg_preprocess.py` |
+|---|---|---|
+| low-pass | 47 Hz | **40 Hz** (`LP_CUTOFF = 40.0`) |
+| notch | yalnız 50 Hz | **50 ve 60 Hz** (`NOTCH_FREQS = (50.0, 60.0)`) |
+| normalizasyon | derivasyon bazında z-score | **medyan-merkezli, 1.4826×MAD, global** |
+
+O belgedeki dil ("yaklaşık ayar", "z-score benzeri") ezberden yazıldığını
+düşündürüyor. **Sunumdan önce koddan doğrulayın:**
+
+```bat
+python -c "import ecg_preprocess as e; print(e.preprocess_config())"
+```
+
+Jüri kodu tekrar koşturma yetkisine sahip (kılavuz md. 2.6). Slaytta 47 Hz
+yazıp kodda 40 Hz çıkması gereksiz bir güven kaybı olur.
 
 ---
 
@@ -47,7 +116,38 @@ Sınıf bazlı F1:
 | LBBB | 0.960526 |
 | RBBB | 0.891089 |
 
-**Güven aralığı:** SE = 0.0129, %95 CI = [0.8140, 0.8644].
+**Güven aralığı:** SE = 0.0129, %95 CI = [0.8140, 0.8644] (20.000 bootstrap).
+
+### Aile bazlı sonuçlar
+
+| aile | OOF | test | ağırlık | fold |
+|---|---|---|---|---|
+| `cv10` | 0.840129 | 0.841608 | **0.671958** | 10 |
+| `main_v2` | 0.836945 | 0.840913 | 0.090122 | 5 |
+| `seed99` | 0.828813 | — | 0.237921 | 5 |
+| `full_v1` | — (OOF yok) | 0.846927 | — | — |
+
+`seed99` tek başına en zayıf ama **ensemble çeşitliliğine katkısı** için tutuldu.
+`full_v1` OOF'suz olduğu için **model seçim kanıtı değildir**, yalnız rapor.
+
+### Veri bölünmesi
+
+```
+5000 kayıt = 3500 train + 750 validation + 750 test_public
+development = train + validation = 4250
+5-fold → her fold ≈ 3400 train / 850 validation
+test_public: sınıf başına 150, toplam 750
+```
+
+### ONNX doğrulaması
+
+```
+ONNX     macro-F1 = 0.841204
+PyTorch  macro-F1 = 0.839928
+fark              = +0.001276      (kabul eşiği < 0.005)  → PASS
+```
+
+PyTorch'suz `.venv_no_torch` ortamında: 750/750, 0 hata, manifest farkı 0.000000.
 
 ---
 
@@ -144,7 +244,7 @@ QRST iptali denendi (aşağıda), gerçek veride kazanç +0.0006.
 
 ---
 
-# BÖLÜM 4 — ELENEN FİKİRLER (14 adet)
+# BÖLÜM 4 — ELENEN FİKİRLER (22 adet)
 
 Her biri ölçülerek elendi. Sunumun en güçlü kısmı budur.
 
@@ -164,6 +264,27 @@ Her biri ölçülerek elendi. Sunumun en güçlü kısmı budur.
 | 12 | **CNN+Transformer hibrit** | aynı tahmin oranı 0.9259, aynı |
 | 13 | **Batch inference** | 4.7× hızlı ama olasılıklar **0.006** saptı |
 | 14 | **2×MP5 hibrit paralellik** | %1 kazanç, 2 kat operasyon riski |
+| 15 | Dış veri +900 AFIB +900 AFL | fold-0 val **−0.0207** |
+| 16 | Dış veri +300 AFIB +300 AFL | **−0.0075** |
+| 17 | Dış veri sınıf-dengeli 300+300 | **−0.0171** ← öncül hipotezini çürüttü |
+| 18 | Dış veri yalnız AFL +300 | −0.0019, bootstrap P(Δ>0) = **0.40** |
+| 19 | Dış veri pretrain → fine-tune | **−0.0173**, AFL 0.6216 → 0.5784 |
+| 20 | Sıfırdan AFIB/AFL uzman | çift F1 0.7070, birleşik **−0.0103** |
+| 21 | Warm-start uzman | inner 0.8492 → **outer 0.6931**, birleşik −0.0071 |
+| 22 | **Waveform-SVM gate** | fold 0/1 **+0.008/+0.011**, fold 2/3/4 −0.004/−0.006/**−0.024** |
+
+## 4.0 Türetilmiş özellikler ve basit sınıflandırıcılar (ayrıca elendi)
+
+| yöntem | çift F1 | karar |
+|---|---|---|
+| Logistic (37 özellik) | 0.7026 | yetersiz |
+| RBF-SVM (37 özellik) | 0.7123 | yetersiz |
+| RBF-SVM (atriyal 18) | 0.6699 | yetersiz |
+| RBF-SVM (ritim 15) | 0.6963 | yetersiz |
+| Türetilmiş 17 özellik | 0.5952 | reddet |
+| 37 + türetilmiş 17 | 0.6867 (inner 0.7706) | reddet |
+| **Wave-only (~90 ölçüm)** | **0.7262** | küçük sinyal |
+| **37 + Wave** | **0.7498** (+0.0375) | umut verdi → 5-fold'da elendi |
 
 ## 4.1 Metodolojik notlar
 
@@ -446,134 +567,179 @@ izlenmiyor. `.gitignore`'a ham uzantılar ve split csv'leri eklendi.
 
 ---
 
-# BÖLÜM 8 — DIŞ VERİ DENEYİ (devam ediyor)
+# BÖLÜM 8 — DIŞ VERİ DENEYİ — **KAPANDI**
 
-## 8.1 İndirilen kaynaklar
+## 8.1 İndirilen ve taranan
 
-| kaynak | inen `.hea` | toplam |
+```
+external_data altında  77.333 .hea
+kaynaklar: Ningbo · Chapman-Shaoxing · PTB-XL · Georgia
+```
+
+## 8.2 Gerçek dry-run sonucu (AFIB+AFL)
+
+```
+competition readable  = 5000/5000
+external .hea         = 77333
+
+aday                     = 10.615
+hedef tanı yok           = 63.573
+istenmeyen sınıf         =  1.591
+ad çakışması             =    950   ← taramanın çalıştığının kanıtı
+birden fazla hedef tanı  =    604   ← --single-label eledi
+
+şekil/imza aynı          =    141   ← SIZINTI, eğitimden atıldı
+korelasyon >= 0.995      =      0
+temiz kabul              = 10.474
+```
+
+> **`stem-only overlaps = 950`** en önemli sağlık kontrolüydü. Sıfır çıksaydı
+> tarama bozuk demekti — temiz demek değil.
+
+**Normal için SNOMED eşlemesi türetilemedi**, bu yüzden dış veri deneyleri
+güvenli biçimde yalnız **AFIB ve AFL** ile yürütüldü.
+
+## 8.3 Beş deney, tek tablo (kontrollü Fold-0, `wide` baseline)
+
+| deney | val(tta) | Δ |
 |---|---|---|
-| Ningbo | 34.905 | 34.905 (%100) |
-| Chapman-Shaoxing | 5.015 | 10.247 |
-| PTB-XL | 5.059 | 21.837 |
-| Georgia | 5.024 | 10.344 |
+| **Competition-only baseline** | **0.8335** | — |
+| AFL-only +300 | 0.8316 | −0.0019 |
+| AFIB +300, AFL +300 | 0.8260 | −0.0075 |
+| 300+300 **sınıf-dengeli** | 0.8164 | −0.0171 |
+| pretrain → fine-tune | 0.8162 | −0.0173 |
+| AFIB +900, AFL +900 | 0.8128 | −0.0207 |
 
-## 8.2 `add_external.py` — SHA-256 `d87da160…`
+**Hepsi negatif. Monoton: ne kadar çok dış veri, o kadar kötü.**
 
-### Üç kademeli sızıntı taraması
-
-1. **Kayıt adı** (uzantı/harf duyarsız)
-2. **Şekil imzası** — her derivasyon z-skorlanır → kazanç/ofset duyarsız
-3. **Korelasyon ≥ 0.995** — II derivasyonu 128 noktaya indirgenir → yeniden
-   örneklenmiş/kırpılmış kopyaları yakalar
-
-### Neden kritik
-
-`test_public` kayıtları açık veri setlerinin **içinde**. Sızarsa test üzerinde
-eğitmiş olursunuz ve **OOF'ta göremezsiniz** — skor yükselir, gerçek başarı düşer.
-
-**Gerçek örnek:** `record_id = NORM_000777` ama dosya adı `JS36591`, ve aynı
-`JS36591` `external_data\ningbo\g26` altında da var. Stem karşılaştırması
-`record_id` üzerinden yapılsaydı **bu sızıntı kaçırılırdı.** Artık çözümlenmiş
-gerçek `.hea` yolundan alınıyor.
-
-### Şema uyumluluğu
-
-Gerçek cache: `record_id, relative_path, header_path, signal_path, label,
-class_id, sampling_rate_hz, lead_count, duration_sec, file_format, split`
-
-Yol çözümü: olduğu gibi → proje kökü → veri kökü → `data/` öneki atılıp veri kökü.
-
-### Sert kapı
-
-Tüm yarışma kayıtları okunmadan cache **yazılmaz**. Okunamayan her kayıt
-taramanın kör noktasıdır; o durumda `leak=0` bir kanıt değil, yanıltmadır.
-
-### Diğer korumalar
-
-- `--single-label` **varsayılan açık** — çoklu SNOMED'li kayıt atlanır
-- `--balance-sources` — kota sınıf içinde kaynaklar arasında dağıtılır
-  (Ningbo 34.905 vs yarışma 5.000 = 7:1; dengelenmezse model sınıfı değil
-  **kaynağı** öğrenir)
-- Etiket haritası tahmin edilmez, **kendi verinizden türetilir**
-- Eklenenler `split="extra"` → her fold'un **eğitimine**, hiçbir fold'un
-  **doğrulamasına** girmez → OOF yalnız yarışma verisinde ölçülmeye devam eder
-
-Test: `tools/test_add_external.py` — 350 kayıtta 23/23, **5000 kayıtta 23/23**.
-
-## 8.3 Fold-0 sonucu (9 Eylül)
+AFL-only +300 için eşleştirilmiş bootstrap:
 
 ```
-Baseline:            best EMA val 0.8370 @ ep30 · TTA val 0.8335 · test_public 0.8281
-+1800 (900 AFIB
-       + 900 AFL):   best EMA val 0.8158 @ ep11 · TTA val 0.8128 · test_public 0.8371
+gözlenen Δ = -0.00188
+%95 aralık = [-0.019361, +0.015187]
+P(Δ > 0)   = 0.4004
 ```
 
-### Gürültü tabanı (simüle edildi)
+## 8.4 Neden — ölçülen cevap
 
-| ölçüm | 1 SE | gözlenen | kaç SE |
+**Sınıf dengesizliği değil.** Dengeli sampler ile epoch exposure
+`[800,800,800,800,800]` yapıldı, düşüş devam etti (−0.0171).
+
+**Classifier head'de de değil.** Pretrain→fine-tune'da 5 sınıflı head
+tamamen sıfırdan kuruldu, backbone aktarıldı (166/168 tensör, %99.97).
+Yine düştü (−0.0173) ve **AFL 0.6216 → 0.5784** ile en çok zarar gören sınıf oldu.
+
+**Domain/etiket uyumsuzluğu.** Yarışma baseline modeli 600 dış AFIB/AFL kaydına
+koşuldu:
+
+| kaynak | AFIB doğru | AFL doğru |
+|---|---|---|
+| Chapman-Shaoxing | 79/100 | 77/96 |
+| PTB-XL | 70/100 | 9/12 |
+| Ningbo | — (n=0) | 73/96 |
+| **Georgia** | **52/100** ← en kötü | 75/96 |
+| **toplam** | **201/300 (%67)** | **234/300 (%78)** |
+
+Georgia AFIB'in %22'si AFIB→AFL yönünde kaydı. Dış AFIB'in bazı kaynaklarda
+yarışma AFIB tanımından belirgin farklı olma ihtimali var.
+
+> Bu "veri seti hatalı" kanıtı **değildir** — popülasyon, cihaz ve tanı
+> konvansiyonu farkları da mümkün.
+
+## 8.5 Karar
+
+> **Dış veri hattı final sisteme alınmadı.**
+
+Bilimsel olarak güçlü bir sonuç: 77.333 kayıt tarandı, sızıntı temizlendi,
+beş farklı strateji denendi, **hiçbiri in-domain validation'da güvenilir kazanç
+üretmedi** — ve `test_public` artışlarına bakılarak model seçilmedi.
+
+---
+
+# BÖLÜM 8B — AFIB/AFL UZMAN ARAŞTIRMASI — **KAPANDI**
+
+## 8B.1 Darboğazın büyüklüğü
+
+Fold-0 karışıklık matrisi:
+
+```
+        Norm AFIB  AFL LBBB RBBB
+Norm  [ 157,   2,   2,   0,   9]
+AFIB  [   1, 141,  25,   1,   2]
+AFL   [   6,  60,  92,   4,   8]
+LBBB  [   3,   0,   4, 161,   2]
+RBBB  [   3,   2,   3,   1, 161]
+```
+
+```
+toplam hata          = 138
+AFIB↔AFL çapraz hata =  85
+pay                  = 61.6%
+```
+
+**Tüm hataların %61.6'sı yalnız bu iki sınıfın karışması.**
+
+### Oracle tavan analizi
+
+Yalnız AFIB↔AFL çapraz hataları kusursuz düzeltilse:
+
+```
+baseline = 0.8335  →  oracle = 0.9377   (headroom +0.1043)
+```
+
+Gerçek performans değil, **teorik tavan** — ama darboğazın büyüklüğünü gösterir.
+
+## 8B.2 Gate doğru, uzman yetersiz
+
+Ana modelin top-2 sınıfı tam `{AFIB, AFL}` olan kayıtlar:
+
+```
+GATE_N              = 271
+gerçek AFIB/AFL     = 266
+gate saflığı        = 0.9815
+çapraz hata kapsamı = 0.9529
+non-pair kirlenme   = 5
+```
+
+**Gate mükemmele yakın.** Sorun gate değil, uzmanın kendisi:
+
+| uzman | çift F1 | birleşik | Δ |
 |---|---|---|---|
-| fold-0 val (1000 kayıt) | 0.011 | −0.021 | 1.98 |
-| test_public (750 kayıt) | 0.013 | +0.009 | **0.72** |
+| Sıfırdan derin | 0.7070 | 0.8232 | −0.0103 |
+| Warm-start | 0.6931 | 0.8264 | −0.0071 |
 
-**Tek fold, tek seed. Test farkı açıkça gürültü.**
-
-### Nedenler, önem sırasıyla
-
-**(a) Sınıf öncülü kayması — en büyük ve mekanik.** `train.py`'de sınıf ağırlığı
-da dengeli örnekleyici de **yok**:
+## 8B.3 En öğretici bulgu: inner → outer çöküşü
 
 ```
-AFIB    800 → 1700   %20 → %29.3   (×1.47)
-AFL     800 → 1700   %20 → %29.3   (×1.47)
-diğer 3  800 → 800   %20 → %13.8   (×0.69)
+Warm-start uzman:     inner 0.8492  →  outer 0.6931
+Türetilmiş özellikler: inner 0.7706  →  outer 0.6867
 ```
 
-Dengeli val kümesinde bu, diğer üç sınıfın recall'unu düşürür → macro-F1 düşer.
-**Gözlenen yön tam olarak beklenen yön.**
+Küçük inner split'lere aşırı uydurma riski, sayılarla belgelendi.
 
-**(b) `ep30 → ep11` — (a)'nın parmak izi.** `train.py:528`: *"patience 99 lets
-cosine fully anneal, which beat early stopping"*. Baseline 30/40'ta (%75 anneal),
-external 11/40'ta (%27.5) zirve yaptı ve sonra 29 epoch **kötüleşti**. Bu,
-"eğitim dağılımına yakınsadıkça dengeli val'den uzaklaşma" imzasıdır.
+## 8B.4 Waveform-SVM gate — 5-fold dersi
 
-**(c) Zamanlama uyumsuzluğu** — +%45 veri = epoch başına +%45 adım; cosine 40
-epoch'a göre ayarlı. Karşılaştırma elmayla elma değil.
+Ham dalga formundan ~90 yeni ölçüm (harmonik yapı, zamansal frekans kararlılığı,
+otokorelasyon periyodikliği, derivasyonlar arası frekans uyumu, atriyal/ventriküler
+iletim oranı). Çift F1: **0.7123 → 0.7498 (+0.0375)** — ilk gerçek umut verici sinyal.
 
-**(d) Domain kayması** — gerçek ama bu desende değil.
+Gate ile birleştirildiğinde:
 
-**(e) Etiket konvansiyonu** — gerçek risk ama (a)–(c)'den ayrıştırılamıyor.
+| fold | baseline | wave gate | Δ |
+|---|---|---|---|
+| 0 | 0.833483 | 0.841856 | **+0.008374** |
+| 1 | 0.843981 | 0.855034 | **+0.011053** |
+| 2 | 0.821613 | 0.817266 | −0.004346 |
+| 3 | 0.829070 | 0.822755 | −0.006315 |
+| 4 | 0.856021 | 0.831589 | **−0.024431** |
+| **ort.** | **0.836834** | **0.833700** | **−0.003134** |
 
-### Karar: deney kurgusu karışık
+**İlk iki fold'da +0.008 ve +0.011 görüp durmak cazipti. Durmadık.** Kalan üç
+fold'da hiçbir şey değiştirmeden (aynı özellikler, gate, seed, C-grid) koşuldu
+ve genellenmedi.
 
-Aynı anda üç şey değişti — boyut (+%45), öncül (uniform → çarpık), alan.
-Atıf yapılamaz. **Direct mixing'in kendisi değil, dengelenmemiş direct mixing
-hatalı.**
-
-## 8.4 Sıradaki üç deney
-
-**E0 — sınıf bazlı F1 kırılımı · maliyet SIFIR**
-
-| gözlenen | anlamı |
-|---|---|
-| AFL/AFIB ↑, diğer üç ↓ | öncül kayması doğrulandı |
-| AFL ↓ | etiket konvansiyonu sorunu |
-| hepsi hafif ↓ | domain kayması |
-
-**E1 — baseline fold-0, ikinci seed · 1 fold**
-Fold-0 val'in seed'ler arası oynamasını bilmeden hiçbir karşılaştırma
-yorumlanamaz.
-
-**E2 — öncül korunarak karıştırma · 1 cache + 1 fold**
-Beş sınıfa da eşit ekle (`--per-class N --balance-sources`, N = en kıt sınıf).
-val toparlanıyorsa → öncül kaymasıydı. Hâlâ düşükse → **DUR**.
-
-## 8.5 Yapılmayacaklar
-
-1. **`test_public`'teki +0.009'a bakarak seçim yapmak** — GOREV.md'nin birinci
-   kuralını çiğner ve 0.72 SE'lik gürültüye 20 checkpoint yatırmaktır
-2. Tam 5-fold × 3 aile başlatmak (karışık öncül üzerine 20 checkpoint)
-3. Pretrain → fine-tune (her modeli iki kez = 40 koşu, 5 güne sığmaz)
-4. `+300 AFIB +300 AFL` (aynı karışık deneyin küçüğü, hiçbir şeyi ayrıştırmaz)
+> **Bu projenin en iyi metodolojik dersi:** tek veya iki iyi fold, final
+> entegrasyon için yeterli değildir.
 
 ---
 
@@ -674,83 +840,160 @@ ama tamamen değil. Kaynak-only kural 0.7295, model 0.7376 — **çok yakın.**
 
 ---
 
-# BÖLÜM 12 — KALAN TAKVİM
+# BÖLÜM 12 — KALAN TAKVİM — **MODEL ARAŞTIRMASI KAPANDI**
+
+## 12.1 Karar (10 Eylül)
+
+> Dış veri ve AFIB/AFL post-processing deneylerinin **hiçbiri** güvenilir
+> validation kazancı üretmedi. Model araştırması durdurulmuştur.
+> Doğrulanmış 20-model ONNX release korunur; enerji sunum ve teslim
+> güvenliğine kaydırılır.
+
+Planladığım "12 Eylül sert abort" tarihine gerek kalmadı — abort koşulu
+**iki gün erken ve çok daha fazla kanıtla** karşılandı: 5 dış veri deneyi +
+6 uzman/gate deneyi, hepsi negatif.
+
+## 12.2 Kalan takvim
 
 | tarih | iş |
 |---|---|
-| **10 Eyl** | E0 (bedava) → E1 + E2 (gece) |
-| **11 Eyl** | E1/E2 sonucu; geçerse tam CV başlat |
-| **12 Eyl akşam** | **SERT ABORT** — McNemar-anlamlı sonuç yoksa MP11 teslim |
-| **13 Eyl** | (geçtiyse) ensemble → export → MP11 prova → karşılaştırma |
-| **14 Eyl** | sunum, offline prova ×2 |
-| **15 Eyl** | freeze, USB ×2, bulut yedeği. **Kod değişmez.** |
-| **16 Eyl** | 09:30 alanda; örnek veri format testi; şifre → koştur → **hemen yükle** |
+| **10–13 Eyl** | **Sunum.** Yeni model deneyi yok. |
+| 13–14 Eyl | Offline prova ×2 (Wi-Fi kapalı, temiz klasör, ikinci bilgisayar) |
+| 14 Eyl | Sunum provası ×3, süre tutarak; soru-cevap kartları |
+| **15 Eyl** | Freeze. USB ×2 + bulut yedeği. **Kod değişmez.** |
+| **16 Eyl** | 09:30 alanda · örnek veri format testi · şifre → koştur → **hemen yükle** |
 
-## Yapılacaklar
+## 12.3 Yapılacaklar
 
-**Teslim:**
+**Teslim güvenliği (öncelik):**
 - [x] `make_submission.py` gerçek veriyle test edildi
-- [x] KYS kimlikleri alındı
-- [x] 8 Eylül örnek JSON gönderildi
+- [x] KYS kimlikleri alındı (807466 / 4997133)
+- [x] 8 Eylül örnek JSON gönderildi ve doğrulandı
+- [ ] Final release SHA-256 kontrolü
 - [ ] Offline prova #1 (Wi-Fi kapalı, temiz klasör)
 - [ ] Offline prova #2 (mümkünse ikinci bilgisayar)
-- [ ] USB ×2 + bulut yedeği
+- [ ] `make_submission.py --validate` hattı tekrar prova
+- [ ] USB ×2 + bulut yedeği (yarışma verisi hariç)
 - [ ] `test_public_ids.txt` USB'den çıkarıldı
 
-**Model:**
-- [ ] `source_breakdown.py` (5 sn) ⚠️
-- [ ] E0 sınıf bazlı F1 kırılımı
-- [ ] E1 ikinci seed
-- [ ] E2 öncül korunarak
-- [ ] (geçerse) tam CV + McNemar
-
 **Sunum:**
+- [ ] **Ön işleme sabitlerini KODDAN doğrula** (Bölüm 0.4)
 - [ ] Organizasyonun şablonu
-- [ ] 10 dakikaya sığdır
-- [ ] 3 kez süre tutarak prova
-- [ ] Soru-cevap hazırlığı
+- [ ] Her sayının doğru etiketi: OOF / test_public / accuracy / fold-mean
+- [ ] 10 dakikaya sığdır, 3 kez süre tutarak prova
+- [ ] 3 dakikalık soru-cevap kartları
+
+**YAPILMAYACAK:**
+- [ ] ~~Yeni model deneyi~~
+- [ ] ~~Son gün eğitim başlatmak~~
 
 ---
 
 # BÖLÜM 13 — SUNUM İÇİN
 
-## Anlatılacak hikâye
+## 13.1 Sayıların DOĞRU adı — bu kritik
 
-Çoğu takımda olmayan bir şey var: **elenmiş fikirlerin kaydı.**
+Bu üç sayı **farklıdır**, karıştırılmamalı:
 
-> "Her fikri ölçtük ve ölçüme göre eledik."
+```
+OOF Macro-F1          = 0.843755    ← model SEÇİMİ bununla yapıldı
+test_public Macro-F1  = 0.841204    ← bağımsız doğrulama
+test_public Accuracy  = 0.845333    ← farklı metrik
+```
 
-- Bayes tavanı hesaplanabilen bir sentetik kıyas kümesi kurduk
-- Eşleştirilmiş **McNemar** testi kullandık
-- Üç kademeli **sızıntı taraması** yazdık
-- Fikirleri **kapılardan** geçirdik, sezgiyle değil
+Ayrıca **fold ortalaması ≠ OOF**:
 
-## Muhtemel sorular
+```
+kontrollü wide baseline fold val(tta):
+  0.833483 · 0.843981 · 0.821613 · 0.829070 · 0.856021
+  aritmetik ortalama = 0.836834      ← BU BİRLEŞİK OOF DEĞİL
+```
+
+Yanlış: *"Doğruluğumuz %84.38"* (eğer OOF macro-F1 kastediliyorsa).
+Doğru: *"OOF Macro-F1 %84.38, bağımsız public test Macro-F1 %84.12."*
+
+## 13.2 Anlatılacak hikâye
+
+Çoğu takımda olmayan şey: **elenmiş fikirlerin kaydı — 22 adet.**
+
+> "Her fikri ölçtük ve ölçüme göre eledik. Kendi hipotezlerimiz dahil."
+
+- Bayes tavanı hesaplanabilen sentetik kıyas kümesi
+- Eşleştirilmiş **McNemar** testi
+- Üç kademeli **sızıntı taraması** (77.333 kayıt tarandı, 141 sızıntı yakalandı)
+- **Fresh fold doğrulaması** — iki iyi fold'a kanmadık
+- Hız optimizasyonunda **bit-birebir** aynı çıktı kanıtı
+
+## 13.3 En güçlü üç anlatı
+
+**(1) "Daha fazla veri her zaman daha iyi değildir."**
+77.333 dış kayıt tarandı, sızıntı temizlendi, beş strateji denendi:
+
+| deney | Δ |
+|---|---|
+| AFL-only +300 | −0.0019 |
+| +300/+300 | −0.0075 |
+| sınıf-dengeli | −0.0171 |
+| pretrain→FT | −0.0173 |
+| +900/+900 | −0.0207 |
+
+Monoton negatif. Sebep ölçüldü: **domain/etiket uyumsuzluğu** (Georgia AFIB
+yalnız 52/100 doğru), sınıf dengesizliği değil (dengeli sampler da düzeltmedi).
+
+**(2) "İki iyi fold yeterli değildir."**
+Waveform-SVM gate fold 0'da +0.0084, fold 1'de +0.0111 verdi. Durup entegre
+etmek çok cazipti. Kalan üç fold'da hiçbir şey değiştirmeden koştuk:
+−0.004, −0.006, **−0.024**. Ortalama −0.0031. **Finale almadık.**
+
+**(3) "Hızlandırma doğruluğu bozmamalı."**
+92 dk → 6.21 dk (**14.8×**), `class_mismatch = 0`, `max_abs_diff = 0.0`.
+Batch inference 4.7× daha hızlıydı ama olasılıkları 0.006 saptırdığı için
+reddettik — kılavuz md. 4 eşitliği PR-AUC ile bozuyor.
+
+## 13.4 Jüri soruları — hazır cevaplar
+
+**"En zor sınıf?"**
+→ AFIB/AFL, özellikle AFL. Fold-0'da **tüm hataların %61.6'sı** bu iki sınıfın
+çapraz karışması (138 hatanın 85'i). Bu çapraz hatalar kusursuz düzeltilse
+macro-F1 0.8335 → 0.9377 olurdu.
 
 **"Neden AFIB/AFL'de düşük?"**
-→ Dört bağımsız yöntem aynı duvara çarptı (0.701/0.760/0.725/0.744). 8.8 M
-parametreli model küçüğünden kötü. Hataların %93.4'ü kararsız bölgede. Bu veri
-kıtlığı değil, sinyal/etiket sınırı. AFL'nin atriyal bandı (2.5–12 Hz) 75 bpm'de
-QRS harmonikleriyle çakışıyor.
+→ Dört bağımsız yöntem aynı duvara çarptı (0.701 / 0.760 / 0.725 / 0.744) ve
+8.8 M parametreli model küçüğünden kötü. AFL'nin atriyal bandı (2.5–12 Hz)
+75 bpm'de QRS harmonikleriyle çakışıyor.
 
-**"Modeli neden büyütmediniz?"**
-→ Büyüttük. 8.8 M parametreli GPU modeli 0.701 verdi, bizim küçük ensemble 0.760.
+**"Uzman model denediniz mi?"**
+→ Evet, altı yolla. Gate'imiz **%98.15 saf** ve çapraz hataların **%95.29'unu**
+yakalıyor — sorun gate değil. Sıfırdan uzman 0.7070, warm-start 0.6931; ikisi
+de birleşikte kaybettirdi.
 
-**"Genelleme?"**
-→ `source_breakdown.py` sayısı + dış veri deneyi. Kaynak-only kural 0.7295,
-model 0.7376 — farkın küçüklüğünü biliyoruz ve söylüyoruz.
+**"Neden dış veri yok?"**
+→ 77.333 header tarandı, 141 sızıntı yakalandı, beş strateji denendi. Hiçbiri
+in-domain validation'da kazanç vermedi. Kullanmadık.
 
-**"Hızlandırma doğruluğu bozmadı mı?"**
-→ 92 dk → 6.21 dk, **14.8×**. `class_mismatch = 0`, `max_abs_diff = 0.0`.
-Batch inference 4.7× daha hızlıydı ama olasılıkları 0.006 saptırdığı için
-reddettik — PR-AUC eşitlik bozucu.
+**"Büyük model denemediniz mi?"**
+→ base48 0.8335, base64 0.8316, base64+dropout 0.8240, base80+dropout 0.8291.
+Kapasite artışı güvenilir kazanç vermedi.
 
-## Dürüstlük cümlesi
+**"250 Hz daha iyi olmaz mıydı?"**
+→ Test edildi: 0.8355 vs 0.8335, **+0.002** — önceden belirlediğimiz 0.01
+anlamlılık eşiğinin altında. 150 Hz daha verimli, korundu.
 
-> "Geliştirmede 0.8412 aldık. Kaynak dengesi düzeltildiğinde beklentimiz şu —
-> ve bunu ölçtük."
+**"Test setine bakıp seçim yaptınız mı?"**
+→ Hayır. Birkaç deneyde test yükselirken validation düştü (ör. dış veri
++900/+900: test +0.009, val −0.021). **O modelleri seçmedik.**
 
-Jüri önünde bunu söyleyebilen takım az olacak.
+**"Yarışma bilgisayarında PyTorch gerekir mi?"**
+→ Hayır. `.venv_no_torch` ortamında 750/750, 0 hata, manifest farkı 0.000000.
+
+## 13.5 Dürüst sınırlamalar (sunumda söylenebilir)
+
+1. AFIB/AFL hâlâ en zor ayrım; özellikle AFL
+2. Ensemble ağırlıkları aynı 4250 OOF üzerinde optimize edildi — meta-seviye
+   aşırı uydurma ihtimali sıfır değil
+3. `cv10` artışı küçük (+0.0032), "sıçrama" gibi sunulmamalı
+4. Public test 750 kayıt → küçük farkların belirsizliği büyük (SE 0.0129)
+5. Final yarışma dağılımı public test'ten farklı olabilir (şartname §7.2)
 
 ---
 
