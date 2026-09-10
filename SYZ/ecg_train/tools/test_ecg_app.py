@@ -1,64 +1,85 @@
-import os, sys, tempfile, shutil
-sys.path.insert(0,"/home/user/deneme/SYZ/ecg_train")
+"""ecg_app cekirdek testleri -- tkinter GEREKMEZ."""
+import os, sys, json, tempfile, shutil
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ecg_app as A
+
 R=[]
 def ck(n,c,d=""):
-    R.append(c); print("  %s %s%s"%("PASS" if c else "FAIL",n,("  <- "+str(d)[:200]) if d and not c else ""))
+    R.append(bool(c)); print("  %s %s%s"%("PASS" if c else "FAIL",n,("  <- "+str(d)[:220]) if d and not c else ""))
 
-tmp=tempfile.mkdtemp()
-data=os.path.join(tmp,"data"); pkg=os.path.join(tmp,"pkg",); os.makedirs(data); os.makedirs(os.path.join(pkg,"models"))
-for i in range(37): open(os.path.join(data,"R%03d.hea"%i),"w").write("x")
-for f in ("make_submission.py","predict.py","manifest.json"): open(os.path.join(pkg,f),"w").write("x")
-open(os.path.join(pkg,"models","m.onnx"),"w").write("x")
+print("[1] min/max zarfi -- QRS tepesi KAYBOLMAMALI")
+# 5000 ornek, tek bir keskin R tepesi. Duz seyreltme onu kacirabilir.
+y=np.zeros(5000); y[2501]=4.0
+lo,hi=A.envelope(y,900)
+ck("tepe korundu (max=4.0)", abs(hi.max()-4.0)<1e-9, hi.max())
+ck("sutun sayisi 900", lo.size==900 and hi.size==900)
+ck("duz seyreltme kacirirdi", y[::5][:900].max()<4.0-1e-9, "kontrol")
+neg=np.zeros(5000); neg[1234]=-3.0
+ck("negatif tepe de korundu", abs(A.envelope(neg,600)[0].min()+3.0)<1e-9)
+ck("kisa sinyal aynen doner", np.array_equal(A.envelope(np.arange(5.),10)[0], np.arange(5.)))
+ck("bos sinyal cokmez", A.envelope(np.zeros(0),10)[0].size==0)
 
-print("[1] kayit sayma")
-n,s=A.count_records(data); ck("37 kayit",n==37,n); ck("ornek id",len(s)==5)
-ck("bos klasor 0",A.count_records(tmp+"/yok")[0]==0)
+print("\n[2] ortak olcek -- derivasyonlar arasi oran korunmali")
+sig=np.zeros((12,1000)); sig[0]=1.0; sig[1]=2.0     # II, I'in iki kati
+sc=A.trace_scale(sig,12,40.0)
+ck("olcek pozitif", sc>0)
+ck("en buyuk genlik tasmiyor", 2.0*sc <= 40.0*0.42+1e-9, 2.0*sc)
+ck("duz sinyalde cokmez", A.trace_scale(np.zeros((12,10)),12,40.0)==1.0)
 
-print("\n[2] sure tahmini (olculen hizlardan)")
-for sp,exp in (("mp11",6.2),("threads2",20.9),("seri",92.0)):
-    got=A.estimate_seconds(750,sp)/60
-    ck("750 @ %-9s ~%.1f dk"%(sp,exp), abs(got-exp)<0.6, "%.1f"%got)
+print("\n[3] yerlesim")
+tr=A.layout_traces(np.random.RandomState(0).randn(12,5000)*0.5, 900, 480)
+ck("12 derivasyon", len(tr)==12, len(tr))
+ck("her derivasyonun noktalari var", all(len(c)>100 for _i,_b,c in tr))
+bl=[b for _i,b,_c in tr]
+ck("taban cizgileri artan", all(bl[i]<bl[i+1] for i in range(11)))
+ck("taban cizgileri tuvalde", all(0<b<480 for b in bl))
+ck("kucuk tuvalde cokmez", A.layout_traces(np.zeros((12,100)),20,20)==[])
 
-print("\n[3] cikti adi -- TEAM_ ikilenmesin")
-ck("807466 -> TEAM_807466_FINAL.json", A.output_name("807466")=="TEAM_807466_FINAL.json", A.output_name("807466"))
-ck("TEAM_001 -> TEAM_001_FINAL.json",  A.output_name("TEAM_001")=="TEAM_001_FINAL.json", A.output_name("TEAM_001"))
+print("\n[4] olasilik siralama ve guven")
+p=np.array([0.05,0.62,0.21,0.08,0.04])
+rows=A.sort_probs(p)
+ck("en yuksek AFIB", rows[0][0]=="AFIB" and abs(rows[0][1]-0.62)<1e-9, rows[0])
+ck("azalan sirali", all(rows[i][1]>=rows[i+1][1] for i in range(4)))
+ck("guven YUKSEK", A.confidence_label(np.array([0.9,.04,.03,.02,.01]))[0]=="YUKSEK")
+ck("guven ORTA",   A.confidence_label(np.array([0.6,.2,.1,.05,.05]))[0]=="ORTA")
+ck("guven DUSUK",  A.confidence_label(np.array([0.4,.35,.15,.05,.05]))[0].startswith("DUSUK"))
 
-print("\n[4] komut kurulumu")
-c=A.build_command(pkg,data,"tkt-26","807466","4997133","mp11")
-ck("--threads 1 var","--threads" in c and c[c.index("--threads")+1]=="1")
-ck("--model-parallel 11 var","--model-parallel" in c and c[c.index("--model-parallel")+1]=="11")
-ck("--ids YOK (varsayilan)","--ids" not in c, c)
-c2=A.build_command(pkg,data,"tkt-26","807466","4997133","mp11",ids_file="x.txt")
-ck("--ids istenince var","--ids" in c2)
-c3=A.build_command(pkg,data,"t","1","2","seri")
-ck("seri modda hiz bayragi yok", "--threads" not in c3 and "--model-parallel" not in c3, c3)
+print("\n[5] olcum secimi")
+import ecg_preprocess as ep
+names=list(ep.FEATURE_NAMES); f=np.arange(len(names),dtype=float)
+v=A.pick_features(f,names)
+ck("bazi olcumler secildi", len(v)>=3, len(v))
+ck("etiket+deger cifti", all(len(t)==2 for t in v))
+ck("NaN atlanir", len(A.pick_features(np.full(len(names),np.nan),names))==0)
+ck("None guvenli", A.pick_features(None,names)==[])
 
-print("\n[5] hazirlik kontrolu -- engelleyiciler")
-ck("hazir paket+veri -> sorun yok", A.check_ready(pkg,data,"807466","4997133")==[], A.check_ready(pkg,data,"807466","4997133"))
-ck("bos team_id yakalandi", any("team_id" in p for p in A.check_ready(pkg,data,"","4997133")))
-_e=os.path.join(tmp,"bos"); os.makedirs(_e,exist_ok=True)
-ck("bos klasor yakalandi", any(".hea" in p for p in A.check_ready(pkg,_e,"1","2")), A.check_ready(pkg,_e,"1","2"))
-ck("eksik paket yakalandi", any("make_submission" in p or "klasoru secilmedi" in p for p in A.check_ready(tmp,data,"1","2")))
+print("\n[6] toplu komut")
+c=A.build_batch_command("/pkg","/data","tkt-26","807466","4997133","mp11")
+ck("--model-parallel 11","--model-parallel" in c and c[c.index("--model-parallel")+1]=="11")
+ck("--ids yok (varsayilan)","--ids" not in c)
+ck("seri modda bayrak yok", "--threads" not in A.build_batch_command("/p","/d","a","1","2","seri"))
+ck("cikti adi", A.output_name("807466")=="TEAM_807466_FINAL.json")
+ck("TEAM_ ikilenmez", A.output_name("TEAM_9")=="TEAM_9_FINAL.json")
 
-print("\n[6] ilerleme ayristirma (make_submission ciktisindan)")
-ck("tahmin 300/750 -> 0.40", abs(A.parse_progress("  tahmin 300/750  120 sn",750)-0.4)<1e-9)
-ck("on isleme 100/750",     abs(A.parse_progress("  on isleme 100/750  9 sn",750)-(100/750))<1e-9)
-ck("alakasiz satir -> None", A.parse_progress("all checks passed",750) is None)
-ck("bozuk satir -> None",    A.parse_progress("  tahmin abc",750) is None)
+print("\n[7] ilerleme ayristirma")
+ck("300/750 -> 0.40", abs(A.parse_progress("  tahmin 300/750  12 sn",750)-0.4)<1e-9)
+ck("alakasiz -> None", A.parse_progress("all checks passed",750) is None)
 
-print("\n[7] CMD alintilama")
-q=A.quote_for_cmd(["py","--root",r"C:\Bir Yer\SYZ"])
-ck("bosluklu yol tirnaklandi", '"C:\\Bir Yer\\SYZ"' in q, q)
+print("\n[8] kayit tarama")
+t=tempfile.mkdtemp()
+os.makedirs(os.path.join(t,"alt"))
+for n in ("b","a"): open(os.path.join(t,n+".hea"),"w").write("x")
+open(os.path.join(t,"alt","c.hea"),"w").write("x")
+recs=A.find_records(t)
+ck("3 kayit, alt klasor dahil", len(recs)==3, len(recs))
+ck("id'ye gore sirali", [r[0] for r in recs]==["a","b","c"], [r[0] for r in recs])
+ck("olmayan klasor -> bos", A.find_records(t+"/yok")==[])
+shutil.rmtree(t,True)
 
-print("\n[8] sonuc okuma")
-import json
-j=os.path.join(tmp,"o.json")
-json.dump({"predictions":[{"id":"a","predicted_class":"AFIB"},{"id":"b","predicted_class":"AFL"}]},open(j,"w"))
-n,d,e=A.read_result(j)
-ck("2 kayit",n==2 and e is None); ck("dagilim",d["AFIB"]==1 and d["AFL"]==1,d)
-n,d,e=A.read_result(os.path.join(tmp,"yok.json")); ck("olmayan dosya -> hata",e is not None)
+print("\n[9] sure tahmini")
+ck("750 @ mp11 ~6 dk", abs(A.estimate_seconds(750,"mp11")/60-6.2)<0.4)
+ck("bicimleme", A.human_time(45)=="45 sn" and "dk" in A.human_time(400))
 
-shutil.rmtree(tmp,True)
-print("\n"+"="*50); print("%d/%d gecti"%(sum(R),len(R)))
+print("\n"+"="*54); print("%d/%d gecti"%(sum(R),len(R)))
 sys.exit(0 if all(R) else 1)
