@@ -23,6 +23,21 @@ IKI FARKLI YOL, BILEREK
                 eklemez. Arayuz cokse bile CLI ayni dosyayi uretir; uretilen
                 JSON elle yazilan komutunkiyle BIREBIR aynidir.
 
+CLI YETENEKLERI -- SABIT BAYRAK YOK
+-----------------------------------
+Projede birden fazla `make_submission.py` var ve CLI'lari ayni degil:
+eski `competition_package` surumu `--model-parallel` bilmez, dogrulanmis
+MP11 paketi bilir. Arayuz hicbir bayragi VARSAYMAZ:
+
+  1. paket secilir  -> resolve_package()      MP destekleyeni tercih eder
+  2. betik sorgulanir -> probe_capabilities()  `--help`, olmazsa kaynak
+  3. menu kurulur   -> yalniz DESTEKLENEN hiz onayarlari gorunur
+  4. komut kurulur  -> build_batch_command(caps=...) desteklenmeyen bir
+                       bayrak uretirse ValueError; sessizce eklemez
+  5. komut TAM HALIYLE log'a yazilir, sonra calistirilir
+
+Yetenek hic okunamazsa bayraksiz (seri) moda dusulur -- her surumde calisir.
+
 Bagimlilik: yalnizca paketin kendisi + tkinter. matplotlib YOK -- dalga
 formu dogrudan Canvas'a ciziliyor, boylece teslim paketine yeni bagimlilik
 girmiyor.
@@ -30,8 +45,10 @@ girmiyor.
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -66,19 +83,29 @@ LEAD_NAMES = ("I", "II", "III", "aVR", "aVL", "aVF",
               "V1", "V2", "V3", "V4", "V5", "V6")
 
 # Olculen hizlar (750 kayit, gercek paket) -- sure tahmini icin.
-MS_PER_RECORD = {"mp11": 497, "mp8": 532, "threads2": 1670, "seri": 7357}
-SPEED_FLAGS = {
-    "mp11": ["--threads", "1", "--model-parallel", "11"],
-    "mp8": ["--threads", "1", "--model-parallel", "8"],
-    "threads2": ["--threads", "2"],
-    "seri": [],
-}
-SPEED_LABELS = [
-    ("mp11", "MP11 · ~6 dk / 750   (onerilen)"),
-    ("mp8", "MP8 · ~7 dk / 750"),
-    ("threads2", "threads=2 · ~21 dk / 750"),
-    ("seri", "seri · ~92 dk / 750"),
+#
+# Her onayar HANGI CLI BAYRAKLARINI gerektirdigini kendi tasir. Projede
+# birden fazla make_submission.py var ve hepsi ayni bayraklari desteklemiyor:
+# eski competition_package surumu --model-parallel BILMIYOR. Bu yuzden
+# arayuz sabit bayrak gondermez -- once secilen betigin yeteneklerini okur,
+# sonra yalnizca DESTEKLENEN bayraklardan komut kurar.
+#
+# Sira HIZLIDAN YAVASA. Bir onayar desteklenmiyorsa listede sonraki
+# desteklenen onayara dusulur (sessizce degil, log'a yazilarak).
+SPEED_PRESETS = [
+    ("mp11", ["--threads", "1", "--model-parallel", "11"], 497,
+     "MP11 · ~6 dk / 750   (onerilen)"),
+    ("mp8", ["--threads", "1", "--model-parallel", "8"], 532,
+     "MP8 · ~7 dk / 750"),
+    ("threads2", ["--threads", "2"], 1670,
+     "threads=2 · ~21 dk / 750"),
+    ("seri", [], 7357,
+     "seri · ~92 dk / 750   (bayrak gerektirmez)"),
 ]
+SPEED_FLAGS = {k: f for k, f, _ms, _l in SPEED_PRESETS}
+MS_PER_RECORD = {k: ms for k, _f, ms, _l in SPEED_PRESETS}
+SPEED_LABELS = [(k, l) for k, _f, _ms, l in SPEED_PRESETS]
+SPEED_ORDER = [k for k, _f, _ms, _l in SPEED_PRESETS]
 
 # Sag panelde gosterilecek olcumler: (ozellik adi, etiket, birim/bicim)
 SHOW_FEATURES = [
@@ -229,14 +256,166 @@ def output_name(team_id):
     return "%s_FINAL.json" % stem
 
 
+# ==========================================================================
+# CLI YETENEK ALGILAMA
+# ==========================================================================
+# Projede birden fazla make_submission.py var ve CLI'lari AYNI DEGIL.
+# Arayuz hicbir bayragi varsayamaz: once secilen betigin `--help` ciktisini
+# okur, hangi uzun secenekleri destekledigini cikarir, komutu SADECE o
+# kumeden kurar. Desteklenmeyen bir bayrak asla otomatik eklenmez.
+
+FLAG_RE = re.compile(r"--[A-Za-z][A-Za-z0-9-]*")
+ADD_ARG_RE = re.compile(r"""add_argument\(\s*["'](--[A-Za-z][A-Za-z0-9-]*)""")
+
+SCRIPT_NAME = "make_submission.py"
+
+
+def script_path(pkg_dir):
+    return os.path.join(pkg_dir or "", SCRIPT_NAME)
+
+
+def flags_of(argv):
+    """Bir komut/bayrak listesindeki uzun secenekler."""
+    return {a for a in argv if a.startswith("--")}
+
+
+def parse_supported_flags(help_text):
+    """`--help` ciktisindaki uzun secenekler."""
+    return set(FLAG_RE.findall(help_text or ""))
+
+
+def scan_script_flags(script):
+    """Betigi CALISTIRMADAN add_argument("--x") cagrilarini oku.
+
+    Aday paketleri elemek icin: hizli, yan etkisiz, import gerektirmez.
+    """
+    try:
+        with io.open(script, "r", encoding="utf-8", errors="replace") as fh:
+            return set(ADD_ARG_RE.findall(fh.read()))
+    except OSError:
+        return set()
+
+
+def probe_capabilities(script, timeout=180):
+    """Secilen make_submission.py'nin gercekten destekledigi bayraklar.
+
+    Yetkili kaynak `--help` -- ciktisini sakliyoruz ki log'a basabilelim.
+    Betik `--help`te cokerse (bozuk kurulum, eksik numpy) kaynak taramasina
+    duseriz. Ikisi de basarisizsa BOS kume doner: cagiran taraf bunu
+    "hicbir bayrak ekleme" olarak yorumlamali.
+    """
+    cap = {"script": script, "flags": set(), "help": "", "source": "",
+           "error": ""}
+    if not script or not os.path.isfile(script):
+        cap["error"] = "%s bulunamadi: %s" % (SCRIPT_NAME, script)
+        return cap
+    try:
+        p = subprocess.run([sys.executable, script, "--help"],
+                           cwd=os.path.dirname(script) or ".",
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout)
+        txt = (p.stdout or "") + (p.stderr or "")
+        found = parse_supported_flags(txt)
+        if p.returncode == 0 and found:
+            cap.update(flags=found, help=txt, source="--help")
+            return cap
+        cap["help"] = txt
+        cap["error"] = "--help kod %d dondu" % p.returncode
+    except Exception as exc:                      # noqa: BLE001
+        cap["error"] = "%s: %s" % (type(exc).__name__, exc)
+    found = scan_script_flags(script)
+    if found:
+        cap.update(flags=found, source="kaynak taramasi")
+    return cap
+
+
+def preset_supported(key, caps):
+    """caps None -> dogrulama yok (eski davranis)."""
+    if caps is None:
+        return True
+    return flags_of(SPEED_FLAGS.get(key, [])) <= set(caps)
+
+
+def choose_preset(want, caps):
+    """(kullanilacak_onayar, aciklama).
+
+    Desteklenmeyen bir onayari SESSIZCE degistirmez -- neden dusuldugunu
+    metin olarak dondurur, arayuz onu log'a yazar.
+    """
+    if preset_supported(want, caps):
+        return want, ""
+    missing = sorted(flags_of(SPEED_FLAGS.get(want, [])) - set(caps or ()))
+    for key in SPEED_ORDER:
+        if preset_supported(key, caps):
+            return key, ("%s kullanilamiyor -- betik %s desteklemiyor; "
+                         "%s kullanilacak" % (want, ", ".join(missing), key))
+    return "seri", ("%s kullanilamiyor -- %s yok; seri kullanilacak"
+                    % (want, ", ".join(missing)))
+
+
+def package_candidates(here):
+    """Aday paket klasorleri: yakindan uzaga, release'ler yeniden eskiye."""
+    out = [os.path.abspath(os.path.join(here, c))
+           for c in ("competition_package", ".", "package")]
+    rel = os.path.join(here, "release")
+    if os.path.isdir(rel):
+        for name in sorted(os.listdir(rel), reverse=True):
+            p = os.path.join(rel, name, "package")
+            if os.path.isdir(p):
+                out.append(os.path.abspath(p))
+    seen, uniq = set(), []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def inspect_package(pkg_dir):
+    sp = script_path(pkg_dir)
+    has = os.path.isfile(sp)
+    return {"dir": pkg_dir,
+            "predict": os.path.isfile(os.path.join(pkg_dir, "predict.py")),
+            "script": has,
+            "flags": scan_script_flags(sp) if has else set()}
+
+
+def resolve_package(here):
+    """(secilen_klasor, tum_adaylar).
+
+    predict.py'si olan adaylar arasindan --model-parallel DESTEKLEYEN ilki
+    secilir. Boylece eski competition_package yuzunden MP11 kaybedilmez.
+    Hicbiri desteklemiyorsa ilk kullanilabilir aday secilir ve hiz onayari
+    yetenek algilamada zaten asagi duser.
+    """
+    infos = [inspect_package(p) for p in package_candidates(here)]
+    usable = [i for i in infos if i["predict"]]
+    for i in usable:
+        if i["script"] and "--model-parallel" in i["flags"]:
+            return i["dir"], infos
+    return (usable[0]["dir"] if usable else here), infos
+
+
 def build_batch_command(pkg_dir, data_root, team_name, team_id, app_id,
-                        speed, ids_file=""):
-    cmd = [sys.executable, os.path.join(pkg_dir, "make_submission.py"),
+                        speed, ids_file="", caps=None):
+    """Toplu isleme komutu.
+
+    caps None  -> dogrulama yok (testler ve elle kullanim).
+    caps kume  -> uretilen HER uzun secenek kumede olmak zorunda; degilse
+                  ValueError. "Rastgele betik + rastgele bayrak" burada olur.
+    """
+    cmd = [sys.executable, script_path(pkg_dir),
            "--root", data_root, "--team-name", team_name,
            "--team-id", team_id, "--application-id", app_id]
-    cmd += SPEED_FLAGS.get(speed, SPEED_FLAGS["mp11"])
-    if ids_file:
+    use, _note = choose_preset(speed, caps)
+    cmd += SPEED_FLAGS.get(use, [])
+    if ids_file and (caps is None or "--ids" in caps):
         cmd += ["--ids", ids_file]
+    if caps is not None:
+        bad = sorted(flags_of(cmd) - set(caps))
+        if bad:
+            raise ValueError("betik su bayraklari desteklemiyor: %s"
+                             % ", ".join(bad))
     return cmd
 
 
@@ -333,20 +512,21 @@ def main():
         print("tkinter bulunamadi -- arayuz acilamiyor.")
         print("Komut satiri yolu her zaman calisir:")
         print('  python make_submission.py --root <KLASOR> --team-name "%s" '
-              "--team-id %s --application-id %s --threads 1 --model-parallel 11"
+              "--team-id %s --application-id %s"
               % (DEFAULT_TEAM_NAME, DEFAULT_TEAM_ID, DEFAULT_APP_ID))
+        print("  (--threads 1 --model-parallel 11 EKLEMEDEN ONCE "
+              "`--help` ile destekledigini dogrulayin)")
         return 1
 
     here = os.path.dirname(os.path.abspath(__file__))
-    pkg_guess = here
-    for cand in ("competition_package", ".", "package"):
-        p = os.path.abspath(os.path.join(here, cand))
-        if os.path.exists(os.path.join(p, "predict.py")):
-            pkg_guess = p
-            break
+    pkg_guess, pkg_infos = resolve_package(here)
 
     S = {"records": [], "i": -1, "model": Model(pkg_guess), "sig": None,
-         "fs": 500.0, "prob": None, "busy": False, "proc": None}
+         "fs": 500.0, "prob": None, "busy": False, "proc": None,
+         # CLI yetenekleri: probe_capabilities() doldurur, komut kurulmadan
+         # once okunur. None = "dogrulanmadi".
+         "cap": None, "caps": None, "speed_keys": list(SPEED_ORDER),
+         "pkg_infos": pkg_infos}
 
     root = tk.Tk()
     root.title(APP_TITLE)
@@ -417,8 +597,13 @@ def main():
     ibox.pack(fill="x", pady=(10, 0))
     lbl_pkg = ttk.Label(ibox, text="", wraplength=300, justify="left")
     lbl_pkg.pack(fill="x")
+    lbl_caps = ttk.Label(ibox, text="", wraplength=300, justify="left",
+                         font=("Consolas", 8))
+    lbl_caps.pack(fill="x", pady=(4, 0))
     ttk.Button(ibox, text="Paket klasorunu degistir...",
                command=lambda: change_pkg()).pack(fill="x", pady=(6, 0))
+    ttk.Button(ibox, text="CLI kontrol (--help)",
+               command=lambda: show_help()).pack(fill="x", pady=(4, 0))
 
     # ---- alt serit -------------------------------------------------------
     bot = ttk.LabelFrame(root, text="Tum klasoru isle → yarisma JSON'u",
@@ -432,12 +617,14 @@ def main():
         ttk.Label(r1, text=lab).pack(side="left")
         ttk.Entry(r1, textvariable=var, width=w).pack(side="left", padx=(4, 12))
     ttk.Label(r1, text="hiz").pack(side="left")
-    cmb = ttk.Combobox(r1, values=[l for _k, l in SPEED_LABELS], width=30,
+    cmb = ttk.Combobox(r1, values=[l for _k, l in SPEED_LABELS], width=34,
                        state="readonly")
     cmb.current(0)
     cmb.pack(side="left", padx=4)
     cmb.bind("<<ComboboxSelected>>",
-             lambda _e: v_speed.set(SPEED_LABELS[cmb.current()][0]))
+             lambda _e: v_speed.set(
+                 S["speed_keys"][min(cmb.current(),
+                                     len(S["speed_keys"]) - 1)]))
 
     r2 = ttk.Frame(bot)
     r2.pack(fill="x", pady=(8, 0))
@@ -621,6 +808,83 @@ def main():
         else:
             lbl_pkg.configure(text="%s\nYUKLENEMEDI: %s"
                               % (m.pkg_dir, m.error), foreground="#c33")
+        probe_async()
+
+    # ---- CLI yetenekleri -------------------------------------------------
+    def probe_async():
+        """Secilen betigi --help ile sorgula. Arayuz donmasin diye ayri is
+        parcaciginda; sonuc gelene kadar komut kurulmaz."""
+        S["cap"] = None
+        S["caps"] = None
+        lbl_caps.configure(text="CLI yetenekleri sorgulaniyor...",
+                           foreground="#888")
+        sp = script_path(v_pkg.get())
+
+        def work():
+            cap = probe_capabilities(sp)
+            root.after(0, lambda: apply_caps(cap))
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_caps(cap):
+        S["cap"] = cap
+        flags = cap["flags"]
+        S["caps"] = flags or None
+        say("")
+        say("CLI kontrol · %s" % cap["script"])
+        if cap["error"]:
+            say("  %s" % cap["error"], "warn")
+        if not flags:
+            # Hicbir bayrak DOGRULANAMADI. Tahmin etmek yerine bayraksiz
+            # (seri) moda dus -- her surumde calisir, yalnizca yavas.
+            lbl_caps.configure(text="CLI yetenekleri OKUNAMADI\n"
+                                    "guvenli mod: bayraksiz (seri)",
+                               foreground="#c33")
+            say("  desteklenen bayraklar okunamadi -> SERI moda dusuldu",
+                "err")
+            rebuild_speed_menu(None, force="seri")
+            return
+        say("  kaynak: %s" % cap["source"])
+        say("  desteklenen: %s" % " ".join(sorted(flags)))
+        has_mp = "--model-parallel" in flags
+        ok_keys = [k for k in SPEED_ORDER if preset_supported(k, flags)]
+        lbl_caps.configure(
+            text="CLI: %s · MP: %s\nhiz: %s"
+                 % (cap["source"], "VAR" if has_mp else "YOK",
+                    ", ".join(ok_keys)),
+            foreground="#2a7" if has_mp else "#c80")
+        if not has_mp:
+            say("  UYARI: bu betik --model-parallel DESTEKLEMIYOR; "
+                "MP11/MP8 secilemez.", "warn")
+            for i in S["pkg_infos"]:
+                if i["predict"] and "--model-parallel" in i["flags"]:
+                    say("  MP destekleyen paket var: %s" % i["dir"], "warn")
+                    break
+        rebuild_speed_menu(flags)
+
+    def rebuild_speed_menu(flags, force=""):
+        """Hiz menusunde YALNIZCA desteklenen onayarlar gorunur."""
+        keys = [k for k in SPEED_ORDER if preset_supported(k, flags)]
+        keys = keys or ["seri"]
+        S["speed_keys"] = keys
+        labels = dict(SPEED_LABELS)
+        cmb.configure(values=[labels[k] for k in keys])
+        cur = force or v_speed.get()
+        if cur not in keys:
+            cur = keys[0]
+        v_speed.set(cur)
+        cmb.current(keys.index(cur))
+
+    def show_help():
+        cap = S.get("cap")
+        if not cap:
+            say("CLI sorgusu henuz bitmedi.", "warn")
+            return
+        say("")
+        say("=== %s --help ===" % cap["script"])
+        for l in (cap["help"] or "(cikti alinamadi)").splitlines():
+            say("  " + l)
+        say("=== desteklenen bayraklar: %s"
+            % (" ".join(sorted(cap["flags"])) or "(yok)"))
 
     # ---- toplu isleme ----------------------------------------------------
     def run_batch():
@@ -630,10 +894,32 @@ def main():
         if not d:
             say("Once bir KLASOR acin (tek dosya yeterli degil).", "warn")
             return
-        cmd = build_batch_command(v_pkg.get(), d, v_tname.get(), v_tid.get(),
-                                  v_aid.get(), v_speed.get())
         log.delete("1.0", "end")
-        say(quote_cmd(cmd))
+        cap = S.get("cap")
+        caps = S.get("caps")
+        if cap is None:
+            say("CLI sorgusu henuz bitmedi -- birkac saniye sonra tekrar "
+                "deneyin.", "warn")
+            return
+        want = v_speed.get()
+        try:
+            cmd = build_batch_command(v_pkg.get(), d, v_tname.get(),
+                                      v_tid.get(), v_aid.get(), want,
+                                      caps=caps)
+        except ValueError as exc:
+            say("KOMUT URETILMEDI: %s" % exc, "err")
+            say("Paket klasorunu degistirin ya da hizi dusurun.", "err")
+            return
+        use, note = choose_preset(want, caps)
+        # Calistirmadan ONCE: hangi betik, hangi yetenek kaynagi, hangi
+        # bayraklar, ve komutun TAM HALI.
+        say("betik  : %s" % script_path(v_pkg.get()))
+        say("yetenek: %s" % (cap.get("source") or "DOGRULANAMADI"))
+        say("bayrak : %s" % (" ".join(sorted(caps)) if caps
+                             else "(dogrulanamadi -- bayrak eklenmedi)"))
+        say("hiz    : %s" % (note or use), "warn" if note else None)
+        say("-" * 70)
+        say("KOMUT: " + quote_cmd(cmd))
         say("-" * 70)
         S["busy"] = True
         b_batch.configure(state="disabled")
@@ -675,12 +961,18 @@ def main():
         bar.configure(value=100)
         v_status.set("bitti")
         out = os.path.join(v_pkg.get(), output_name(v_tid.get()))
+        caps = S.get("caps")
+        if caps is not None and "--validate" not in caps:
+            say("Bu betik --validate desteklemiyor; dogrulama atlandi.",
+                "warn")
+            return
+        vcmd = [sys.executable, script_path(v_pkg.get()), "--validate", out]
         say("")
         say("Dogrulama kosuluyor...")
+        say("KOMUT: " + quote_cmd(vcmd))
         try:
             p = subprocess.run(
-                [sys.executable, os.path.join(v_pkg.get(), "make_submission.py"),
-                 "--validate", out], cwd=v_pkg.get(), capture_output=True,
+                vcmd, cwd=v_pkg.get(), capture_output=True,
                 text=True, encoding="utf-8", errors="replace")
             lines = [l for l in (p.stdout or "").splitlines() if l.strip()]
             if lines and "all checks passed" in lines[-1]:

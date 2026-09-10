@@ -62,6 +62,80 @@ ck("seri modda bayrak yok", "--threads" not in A.build_batch_command("/p","/d","
 ck("cikti adi", A.output_name("807466")=="TEAM_807466_FINAL.json")
 ck("TEAM_ ikilenmez", A.output_name("TEAM_9")=="TEAM_9_FINAL.json")
 
+print("\n[6b] CLI yetenek algilama -- YASANAN HATA")
+# Kullanicinin gordugu hata: eski competition_package'a --model-parallel 11
+# gonderildi -> "unrecognized arguments". Bu bir daha URETILEMEMELI.
+ESKI = {"--root","--ids","--models","--threads","--team-name","--team-id",
+        "--application-id","--out","--max-fail","--validate","--workers",
+        "--cache-sessions","--retag"}
+YENI = ESKI | {"--model-parallel"}
+ck("eski CLI'da --model-parallel yok", "--model-parallel" not in ESKI)
+c=A.build_batch_command("/pkg","/d","t","1","2","mp11",caps=ESKI)
+ck("eski betige --model-parallel GONDERILMEZ", "--model-parallel" not in c, c)
+ck("eski betikte en iyi desteklenen: threads2",
+   "--threads" in c and c[c.index("--threads")+1]=="2", c)
+ck("dusurme sebebi bildirilir",
+   "--model-parallel" in A.choose_preset("mp11",ESKI)[1], A.choose_preset("mp11",ESKI))
+c=A.build_batch_command("/pkg","/d","t","1","2","mp11",caps=YENI)
+ck("yeni betikte MP11 korunur",
+   "--model-parallel" in c and c[c.index("--model-parallel")+1]=="11", c)
+ck("yeni betikte dusurme yok", A.choose_preset("mp11",YENI)[1]=="")
+ck("caps=None -> eski davranis (filtre yok)",
+   "--model-parallel" in A.build_batch_command("/p","/d","t","1","2","mp11"))
+ck("--ids desteklenmiyorsa atlanir",
+   "--ids" not in A.build_batch_command("/p","/d","t","1","2","seri",
+                                        ids_file="x.txt",
+                                        caps={"--root","--team-name",
+                                              "--team-id","--application-id"}))
+ck("--ids destekleniyorsa eklenir",
+   "--ids" in A.build_batch_command("/p","/d","t","1","2","seri",
+                                    ids_file="x.txt",caps=ESKI))
+try:
+    A.build_batch_command("/p","/d","t","1","2","seri",caps={"--root"})
+    ck("temel bayrak eksikse ValueError", False, "hata atmadi")
+except ValueError as e:
+    ck("temel bayrak eksikse ValueError", "--team-id" in str(e), e)
+ck("bos caps'te seri secilir", A.choose_preset("mp11",set())[0]=="seri")
+
+print("\n[6c] yetenek ayristirma")
+H=("usage: make_submission.py [-h] [--root ROOT] [--threads THREADS]\n"
+   "  --cache-sessions   onbellek\n  --model-parallel N  paralel\n")
+f=A.parse_supported_flags(H)
+ck("--help'ten cikarilir", {"--root","--threads","--model-parallel"} <= f, sorted(f))
+ck("-h uzun secenek degil", "-h" not in f)
+ck("bos metin -> bos kume", A.parse_supported_flags("")==set())
+t=tempfile.mkdtemp()
+sp=os.path.join(t,"make_submission.py")
+open(sp,"w").write('ap.add_argument("--root")\nap.add_argument("--model-parallel", type=int)\n')
+ck("kaynak taramasi calisir",
+   A.scan_script_flags(sp)=={"--root","--model-parallel"}, A.scan_script_flags(sp))
+ck("olmayan dosya -> bos", A.scan_script_flags(os.path.join(t,"yok.py"))==set())
+cap=A.probe_capabilities(os.path.join(t,"yok.py"))
+ck("olmayan betik: bos yetenek + hata", cap["flags"]==set() and cap["error"])
+ck("script_path birlestirir",
+   A.script_path("/pkg").replace("\\","/")=="/pkg/make_submission.py")
+shutil.rmtree(t,True)
+
+print("\n[6d] paket secimi -- MP destekleyen TERCIH EDILIR")
+t=tempfile.mkdtemp()
+def mkpkg(d, mp):
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d,"predict.py"),"w").write("x")
+    open(os.path.join(d,"make_submission.py"),"w").write(
+        'ap.add_argument("--root")\nap.add_argument("--threads")\n'
+        + ('ap.add_argument("--model-parallel")\n' if mp else ""))
+mkpkg(os.path.join(t,"competition_package"), False)   # eski -- MP YOK
+mkpkg(os.path.join(t,"release","verified_mp11_fast_2026-09-09","package"), True)
+sel,infos=A.resolve_package(t)
+ck("MP'li release secildi", "verified_mp11_fast" in sel, sel)
+ck("adaylar listelendi", len(infos)>=2, len(infos))
+shutil.rmtree(t,True)
+t=tempfile.mkdtemp()
+mkpkg(os.path.join(t,"competition_package"), False)   # tek aday, MP yok
+sel,_=A.resolve_package(t)
+ck("MP yoksa mevcut paket secilir", sel.endswith("competition_package"), sel)
+shutil.rmtree(t,True)
+
 print("\n[7] ilerleme ayristirma")
 ck("300/750 -> 0.40", abs(A.parse_progress("  tahmin 300/750  12 sn",750)-0.4)<1e-9)
 ck("alakasiz -> None", A.parse_progress("all checks passed",750) is None)
