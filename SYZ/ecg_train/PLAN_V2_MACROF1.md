@@ -11,7 +11,7 @@
 
 ### Hazırlık
 
-- [ ] **(S)** ext_v2 eğitimine dokunmayın, bitmesini bekleyin (~10:40). Yanında ikinci bir eğitim başlatmayın.
+- [x] **(S)** ext_v2 eğitiminin bitmesini bekleyin — 10:34'te bitti, 9,2 sa, hata yok.
 - [ ] **(S)** Branch'i çekin: `git fetch origin` → `git checkout claude/egitim-raporu-macro-f1-ictmn0`
 - [ ] **(S)** `SYZ\ecg_train\tools\` içindeki `v2_analiz.py` ve `v2_karsilastir.py` dosyalarını `ecg_train_v2\tools\` klasörüne kopyalayın.
 - [ ] **(S)** `ecg_train_v2` klasöründe bir terminal açıp `claude remote-control` çalıştırın (ya da Claude Desktop'u açın).
@@ -74,8 +74,18 @@ tutarlı:
 - Dış AFIB eklemek her seferinde kötüleştirdi.
 - Georgia AFIB'in %22'si AFL sanıldı.
 
+**Yeni kanıt (5 fold, `kaynak_raporu.txt`):** Chapman-Shaoxing'deki gerçek AFIB
+kayıtlarının yalnız **%25–31'i** doğru tahmin ediliyor; çoğu AFL sanılıyor.
+Chapman ile Ningbo aynı veri tabanından geliyor ve kayıt düzenleri aynı (ikisi de
+JS önekli). Ningbo'daki binlerce "AFL" gerçekte AF ise, model "Chapman/Ningbo
+düzeninde bir kayıtta AF'ye benzer ritim → AFL" kuralını öğrenmiştir ve
+Chapman'ın AFIB'ini tam da bu yüzden AFL sanar. Chapman'ın AF:AFL oranı gerçekçi
+(1780:445 ≈ 4:1), Ningbo'nunki değil (0:7615). Bu yüzden şüpheli etiket büyük
+olasılıkla **Chapman'ınki değil, Ningbo'nunki**.
+
 → **Test:** `v2_analiz.py`, bölüm C. Kayıtların RR düzenliliğine (sınıf ve kaynak
-bazında) bakıyor. Eğitim gerekmiyor.
+bazında) bakıyor. Eğitim gerekmiyor. Beklenen: Chapman AFIB ve Ningbo AFL'nin
+"düzenli %" değerleri ikisi de düşük, Chapman AFL'ninki belirgin biçimde yüksek.
 
 **H2 — eğitim bütçesi.** Doğrulama skoru eğitimin sonuna kadar yükseliyor (en iyi
 epoch 36, 40, 40). Epoch başına 10.000 örnek gösteriliyor, bu da eğitim kümesinin
@@ -194,6 +204,7 @@ AFIB/AFL'ye yatırım yapmak, yanlış sayıyı yükseltme riski taşır.
 | # | komut / değişiklik | fold | OOF F1 | Δ | P(Δ>0) | ensemble Δ | karar |
 |---|---|---|---|---|---|---|---|
 | A0 | `v2_analiz` (3 fold) | 0–2 | 0.8426 | — | — | — | |
+| B0 | ext_v2 `summary.json` (test_public 5-fold ens. **0.8510**, AFIB 0.622) | 0–4 | **0.8402** | — | — | — | yeni taban |
 | A1 | `v2_analiz` (5 fold) | 0–4 | | — | — | — | |
 | D2 | sınıf bias'ı | 0–4 | | | | — | |
 | E2 | yığma + 37 özellik | 0–4 | | | | — | |
