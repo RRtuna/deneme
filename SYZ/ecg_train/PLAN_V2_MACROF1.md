@@ -5,6 +5,40 @@
 
 ---
 
+## 0. Yapılacaklar
+
+**(S)** = siz yaparsınız · **(C)** = bilgisayarınızdaki Claude oturumunda ben yaparım
+
+### Hazırlık
+
+- [ ] **(S)** ext_v2 eğitimine dokunmayın, bitmesini bekleyin (~10:40). Yanında ikinci bir eğitim başlatmayın.
+- [ ] **(S)** Branch'i çekin: `git fetch origin` → `git checkout claude/egitim-raporu-macro-f1-ictmn0`
+- [ ] **(S)** `SYZ\ecg_train\tools\` içindeki `v2_analiz.py` ve `v2_karsilastir.py` dosyalarını `ecg_train_v2\tools\` klasörüne kopyalayın.
+- [ ] **(S)** `ecg_train_v2` klasöründe bir terminal açıp `claude remote-control` çalıştırın (ya da Claude Desktop'u açın).
+- [ ] **(S, isteğe bağlı)** v2 `train.py`'yi push edin. T4'ü ancak kodu görünce ekleyebilirim.
+
+### Analiz (eğitim yok, dakikalar sürer)
+
+- [ ] **(C)** Adım 0: `v2_analiz.py` biten 3 fold'la koşar. Eğitim sürerken `OMP_NUM_THREADS=2` ile koşulur.
+- [ ] **(C)** Adım 1: ext_v2 bitince aynı analiz 5 fold'la tekrarlanır. Bu sayılar yeni taban olur.
+- [ ] **(C)** D2 (sınıf bias'ı) ve E2 (yığma) kapıyı geçtiyse final tahmine eklenir.
+- [ ] **(S)** C sonucu Ningbo hipotezini doğrularsa hedefi siz seçersiniz: aynı hastanelerden gelen test mi, yeni veri seti mi? (§3)
+
+### Tarama eğitimleri (fold 0, sırayla)
+
+- [ ] **(C)** T1 `--label_smoothing 0.1`, ~2,3 sa → `v2_karsilastir.py`
+- [ ] **(C)** T2 `--epochs 60`, ~3,5 sa → `v2_karsilastir.py`
+- [ ] **(C)** T3 `--preset w64`, ~3,5 sa → `v2_karsilastir.py`
+- [ ] **(C)** T4 yumuşatılmış örnekleme (`train.py` gelirse)
+
+### Final
+
+- [ ] **(C)** Kapıyı geçen ayarla tam 5-fold koşu yapılır (gece, `--seed 42`).
+- [ ] **(C)** `v2_karsilastir.py runs\ext_v2 runs\<kazanan>` çalıştırılır; final sistem iki koşunun 10 modelinin ortalaması olur (+ D2 bias'ı, kapıyı geçtiyse).
+- [ ] **(C)** Her sonuç §4'teki tabloya yazılır, negatifler dahil.
+
+---
+
 ## 1. Rapordan teşhis
 
 ### 1.1 Kayıp nerede
